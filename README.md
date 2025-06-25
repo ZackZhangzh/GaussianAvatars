@@ -1,12 +1,39 @@
-#
+# GaussianAvatars
 
-## GaussianAvatars
+## require
 
 ```bash
-
 conda activate gaussian-avatars
 export CUDA_VISIBLE_DEVICES=1
 ```
+
+## cfg
+
+```bash
+export CUDA_VISIBLE_DEVICES=4
+SUBJECT="luo_128"
+SEQUENCE="rigid" 
+ITER=300000
+OUTPUT="MRI_fit_70lmk"
+MESH_PATH='../data/MRI/MRI_luotao_fit_scan_70lmk_+uv.obj'
+
+
+export CUDA_VISIBLE_DEVICES=6
+SUBJECT="luo_128"
+SEQUENCE="rigid" 
+ITER=300000
+OUTPUT="MRI_merge"
+MESH_PATH="../data/MRI/MRI_luotao_merge.obj"
+
+export CUDA_VISIBLE_DEVICES=7
+SUBJECT="luo_128"
+SEQUENCE="rigid" 
+ITER=300000
+OUTPUT="MRI_original"
+MESH_PATH="../data/MRI/MRI_luotao_skin_original.obj"
+```
+
+## train
 
 ```bash
 # train
@@ -26,37 +53,15 @@ python local_viewer.py --use_mri_model \
 --point_path ../output/gaussian/${OUTPUT}/point_cloud/iteration_${ITER}/point_cloud.ply --mesh_path ${MESH_PATH}
 ```
 
-$(seq 10000 10000 $ITER | tr '\n' ' ')
+## msic
 
-## cfg
+```Bash
+REMOTE=
 
-```bash
-export CUDA_VISIBLE_DEVICES=5
-SUBJECT="luo_128"
-SEQUENCE="rigid" 
-ITER=300000
-OUTPUT="MRI_fit_70lmk"
-MESH_PATH='../data/MRI/MRI_luotao_fit_scan_70lmk.obj'
-
-
-export CUDA_VISIBLE_DEVICES=6
-SUBJECT="luo_128"
-SEQUENCE="rigid" 
-ITER=300000
-OUTPUT="MRI_merge"
-MESH_PATH="../data/MRI/MRI_luotao_merge.obj"
-
-export CUDA_VISIBLE_DEVICES=7
-SUBJECT="luo_128"
-SEQUENCE="rigid" 
-ITER=300000
-OUTPUT="MRI_original"
-MESH_PATH="../data/MRI/MRI_luotao_skin_original.obj"
-
-
-
-
+scp -P 22112 -r zhangzhh12024@10.15.49.36:"${REMOTE/#\/home/\/grpczm}" .
 ```
+
+$(seq 10000 10000 $ITER | tr '\n' ' ')
 
 SUBJECT="luo_128"
 SEQUENCE="EMO-1"

@@ -167,8 +167,8 @@ class MRIHead(nn.Module):
         if static_offset is not None:
             vertices = vertices + static_offset
 
-        SCALE_FACTOR = 0.8306812884531367
-        vertices = vertices * SCALE_FACTOR
+        # SCALE_FACTOR = 0.8306812884531367
+        # vertices = vertices * SCALE_FACTOR
 
         if rotation is not None:
             from pytorch3d.transforms import axis_angle_to_matrix
