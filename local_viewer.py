@@ -200,10 +200,20 @@ class LocalViewer(Mini3DViewer):
                         'num_verts': verts.shape[0],
                         'num_faces': faces.shape[0],
                         'renderer': NVDiffRenderer(use_opengl=False),  # 独立渲染器
+                        'opacity': 0.5,  # Default opacity
+                        'color': torch.tensor([1.0, 1.0, 1.0, 0.5]),  # Default white
                     }
                     
+                    # Set color based on skull/jaw assignment
+                    skull_id, jaw_id = self.cfg.skull_jaw if hasattr(self.cfg, 'skull_jaw') else (None, None)
+                    if segment_id == skull_id:
+                        segment_data['color'] = torch.tensor([0.3, 0.5, 1.0, 0.5])  # Blue for skull
+                    elif segment_id == jaw_id:
+                        segment_data['color'] = torch.tensor([1.0, 0.3, 0.3, 0.5])  # Red for jaw
+                    
                     segment_list.append((segment_id, segment_data))
-                    self.segment_visible[segment_id] = True  # Default visible
+
+                    self.segment_visible[segment_id] = False  # Default hidden
                     
                     print(f"[Segment]   Loaded Segment_{segment_id}: {verts.shape[0]} vertices, {faces.shape[0]} faces")
                     print(f"[Segment]     Batched shape: verts={verts_batched.shape}, faces={faces_batched.shape}")
@@ -890,119 +900,160 @@ class LocalViewer(Mini3DViewer):
             with dpg.group(horizontal=True):
                 dpg.add_button(label="save image", tag="_button_save_image", callback=callback_save_image)
 
-        # window: FLAME ==================================================================================================
-        if self.gaussians.binding is not None:
-            with dpg.window(label="FLAME parameters", tag="_flame_window", autosize=True, pos=(self.W-300, 0)):
-                def callback_enable_control(sender, app_data):
-                    if app_data:
+        # window: control panel (positioned at right edge)
+        window_width = 400  # Control panel width
+        window_x = self.W - window_width - 10  # 10px margin from right edge
+        with dpg.window(label="Control Panel", tag="_control_window", autosize=True, pos=(window_x, 0), width=window_width):
+            
+            # window: FLAME ==================================================================================================
+            if self.gaussians.binding is not None:
+                with dpg.collapsing_header(label="FLAME parameters", default_open=False):
+                    def callback_enable_control(sender, app_data):
+                        if app_data:
+                            self.gaussians.update_mesh_by_param_dict(self.flame_param)
+                        else:
+                            self.gaussians.select_mesh_by_timestep(self.timestep)
+                        self.need_update = True
+                    dpg.add_checkbox(label="enable control", default_value=False, tag="_checkbox_enable_control", callback=callback_enable_control)
+
+                    dpg.add_separator()
+
+                    def callback_set_pose(sender, app_data):
+                        joint, axis = sender.split('-')[1:3]
+                        axis_idx = {'x': 0, 'y': 1, 'z': 2}[axis]
+                        self.flame_param[joint][0, axis_idx] = app_data
+                        if joint == 'eyes':
+                            self.flame_param[joint][0, 3+axis_idx] = app_data
+                        if not dpg.get_value("_checkbox_enable_control"):
+                            dpg.set_value("_checkbox_enable_control", True)
                         self.gaussians.update_mesh_by_param_dict(self.flame_param)
-                    else:
-                        self.gaussians.select_mesh_by_timestep(self.timestep)
-                    self.need_update = True
-                dpg.add_checkbox(label="enable control", default_value=False, tag="_checkbox_enable_control", callback=callback_enable_control)
-
-                dpg.add_separator()
-
-                def callback_set_pose(sender, app_data):
-                    joint, axis = sender.split('-')[1:3]
-                    axis_idx = {'x': 0, 'y': 1, 'z': 2}[axis]
-                    self.flame_param[joint][0, axis_idx] = app_data
-                    if joint == 'eyes':
-                        self.flame_param[joint][0, 3+axis_idx] = app_data
-                    if not dpg.get_value("_checkbox_enable_control"):
-                        dpg.set_value("_checkbox_enable_control", True)
-                    self.gaussians.update_mesh_by_param_dict(self.flame_param)
-                    self.need_update = True
-                dpg.add_text(f'Joints')
-                self.pose_sliders = []
-                max_rot = 0.5
-                for joint in ['neck', 'jaw', 'eyes']:
-                    if joint in self.flame_param:
-                        with dpg.group(horizontal=True):
-                            dpg.add_slider_float(min_value=-max_rot, max_value=max_rot, format="%.2f", default_value=self.flame_param[joint][0, 0], callback=callback_set_pose, tag=f"_slider-{joint}-x", width=70)
-                            dpg.add_slider_float(min_value=-max_rot, max_value=max_rot, format="%.2f", default_value=self.flame_param[joint][0, 1], callback=callback_set_pose, tag=f"_slider-{joint}-y", width=70)
-                            dpg.add_slider_float(min_value=-max_rot, max_value=max_rot, format="%.2f", default_value=self.flame_param[joint][0, 2], callback=callback_set_pose, tag=f"_slider-{joint}-z", width=70)
-                            self.pose_sliders.append(f"_slider-{joint}-x")
-                            self.pose_sliders.append(f"_slider-{joint}-y")
-                            self.pose_sliders.append(f"_slider-{joint}-z")
-                            dpg.add_text(f'{joint:4s}')
-                dpg.add_text('   roll       pitch      yaw')
-                
-                dpg.add_separator()
-                
-                def callback_set_expr(sender, app_data):
-                    expr_i = int(sender.split('-')[2])
-                    self.flame_param['expr'][0, expr_i] = app_data
-                    if not dpg.get_value("_checkbox_enable_control"):
-                        dpg.set_value("_checkbox_enable_control", True)
-                    self.gaussians.update_mesh_by_param_dict(self.flame_param)
-                    self.need_update = True
-                self.expr_sliders = []
-                dpg.add_text(f'Expressions')
-                for i in range(5):
-                    dpg.add_slider_float(label=f"{i}", min_value=-3, max_value=3, format="%.2f", default_value=0, callback=callback_set_expr, tag=f"_slider-expr-{i}", width=250)
-                    self.expr_sliders.append(f"_slider-expr-{i}")
-
-                def callback_reset_flame(sender, app_data):
-                    self.reset_flame_param()
-                    if not dpg.get_value("_checkbox_enable_control"):
-                        dpg.set_value("_checkbox_enable_control", True)
-                    self.gaussians.update_mesh_by_param_dict(self.flame_param)
-                    self.need_update = True
-                    for slider in self.pose_sliders + self.expr_sliders:
-                        dpg.set_value(slider, 0)
-                dpg.add_button(label="reset FLAME", tag="_button_reset_flame", callback=callback_reset_flame)
-
-        # window: Segment Control (Level 2) ==================================================================================================
-        if len(self.segment_meshes) > 0:
-            with dpg.window(label="Segment Meshes", tag="_segment_window", autosize=True, pos=(self.W-350, self.H//2)):
-                
-                dpg.add_text(f"Loaded {len(self.segment_meshes)} segments")
-                dpg.add_separator()
-                
-                # Segment visibility controls
-                for seg_id in sorted(self.segment_meshes.keys()):
-                    skull_id, jaw_id = self.cfg.skull_jaw
-                    label = f"Segment_{seg_id}"
-                    if self.cfg.lbs:  # Only show labels if LBS is enabled
-                        if seg_id == skull_id:
-                            label += " (Skull)"
-                        elif seg_id == jaw_id:
-                            label += " (Jaw)"
+                        self.need_update = True
+                    dpg.add_text(f'Joints')
+                    self.pose_sliders = []
+                    max_rot = 0.5
+                    for joint in ['neck', 'jaw', 'eyes']:
+                        if joint in self.flame_param:
+                            with dpg.group(horizontal=True):
+                                dpg.add_slider_float(min_value=-max_rot, max_value=max_rot, format="%.2f", default_value=self.flame_param[joint][0, 0], callback=callback_set_pose, tag=f"_slider-{joint}-x", width=70)
+                                dpg.add_slider_float(min_value=-max_rot, max_value=max_rot, format="%.2f", default_value=self.flame_param[joint][0, 1], callback=callback_set_pose, tag=f"_slider-{joint}-y", width=70)
+                                dpg.add_slider_float(min_value=-max_rot, max_value=max_rot, format="%.2f", default_value=self.flame_param[joint][0, 2], callback=callback_set_pose, tag=f"_slider-{joint}-z", width=70)
+                                self.pose_sliders.append(f"_slider-{joint}-x")
+                                self.pose_sliders.append(f"_slider-{joint}-y")
+                                self.pose_sliders.append(f"_slider-{joint}-z")
+                                dpg.add_text(f'{joint:4s}')
+                    dpg.add_text('   roll       pitch      yaw')
                     
-                    def callback_segment_visibility(sender, app_data, user_data):
-                        seg_id = user_data
-                        self.segment_visible[seg_id] = app_data
+                    dpg.add_separator()
+                    
+                    def callback_set_expr(sender, app_data):
+                        expr_i = int(sender.split('-')[2])
+                        self.flame_param['expr'][0, expr_i] = app_data
+                        if not dpg.get_value("_checkbox_enable_control"):
+                            dpg.set_value("_checkbox_enable_control", True)
+                        self.gaussians.update_mesh_by_param_dict(self.flame_param)
+                        self.need_update = True
+                    self.expr_sliders = []
+                    dpg.add_text(f'Expressions')
+                    for i in range(5):
+                        dpg.add_slider_float(label=f"{i}", min_value=-3, max_value=3, format="%.2f", default_value=0, callback=callback_set_expr, tag=f"_slider-expr-{i}", width=250)
+                        self.expr_sliders.append(f"_slider-expr-{i}")
+
+                    def callback_reset_flame(sender, app_data):
+                        self.reset_flame_param()
+                        if not dpg.get_value("_checkbox_enable_control"):
+                            dpg.set_value("_checkbox_enable_control", True)
+                        self.gaussians.update_mesh_by_param_dict(self.flame_param)
+                        self.need_update = True
+                        for slider in self.pose_sliders + self.expr_sliders:
+                            dpg.set_value(slider, 0)
+                    dpg.add_button(label="reset FLAME", tag="_button_reset_flame", callback=callback_reset_flame)
+
+            # === Segment Mesh Controls ===
+            if len(self.segment_meshes) > 0:
+                with dpg.collapsing_header(label="Segment Controls", default_open=False):
+                    
+                    # Toggle All/None buttons
+                    with dpg.group(horizontal=True):
+                        def callback_show_all(sender, app_data):
+                            for seg_id in self.segment_meshes:
+                                self.segment_visible[seg_id] = True
+                                dpg.set_value(f"_checkbox_segment_{seg_id}", True)
+                            self.need_update = True
+                        
+                        def callback_hide_all(sender, app_data):
+                            for seg_id in self.segment_meshes:
+                                self.segment_visible[seg_id] = False
+                                dpg.set_value(f"_checkbox_segment_{seg_id}", False)
+                            self.need_update = True
+                        
+                        dpg.add_button(label="Show All", callback=callback_show_all, width=80)
+                        dpg.add_button(label="Hide All", callback=callback_hide_all, width=80)
+                    
+                    dpg.add_spacer(height=5)
+                    
+                    # Visibility toggles for each segment
+                    for seg_id in sorted(self.segment_meshes.keys()):
+                        seg_name = self.segment_meshes[seg_id]['name']
+                        
+                        # Special colors for skull and jaw
+                        skull_id, jaw_id = self.cfg.skull_jaw if hasattr(self.cfg, 'skull_jaw') else (None, None)
+                        if seg_id == skull_id:
+                            label_color = "🔵 " + seg_name  # Blue for skull
+                        elif seg_id == jaw_id:
+                            label_color = "🔴 " + seg_name  # Red for jaw
+                        else:
+                            label_color = seg_name
+                        
+                        def callback_toggle_visibility(sender, app_data, user_data):
+                            seg_id = user_data
+                            self.segment_visible[seg_id] = app_data
+                            self.need_update = True
+                        
+                        def callback_segment_opacity(sender, app_data, user_data):
+                            seg_id = user_data
+                            self.segment_meshes[seg_id]['opacity'] = app_data
+                            self.need_update = True
+
+                        with dpg.group(horizontal=True):
+                            dpg.add_checkbox(
+                                label=label_color,
+                                default_value=self.segment_visible[seg_id],
+                                callback=callback_toggle_visibility,
+                                user_data=seg_id,
+                                tag=f"_checkbox_segment_{seg_id}"
+                            )
+                            
+                            # Opacity slider for this segment
+                            dpg.add_slider_float(
+                                label=f"Opacity##{seg_id}",
+                                min_value=0.0, max_value=1.0,
+                                default_value=self.segment_meshes[seg_id].get('opacity', 0.5), # Default to 0.5 if not set
+                                format="%.2f",
+                                callback=callback_segment_opacity,
+                                user_data=seg_id,
+                                width=100
+                            )
+
+            # window: LBS Control (Level 3) ==================================================================================================
+            if self.cfg.lbs and self.lbs_controller is not None:
+                with dpg.collapsing_header(label="LBS Control", default_open=False):
+                    
+                    # === 权重可视化 ===
+                    def callback_show_weights(sender, app_data):
+                        self.show_lbs_weights = app_data
                         self.need_update = True
                     
                     dpg.add_checkbox(
-                        label=label,
-                        default_value=True,
-                        callback=callback_segment_visibility,
-                        user_data=seg_id,
-                        tag=f"_checkbox_segment_{seg_id}"
+                        label="Show LBS Weights",
+                        default_value=False,
+                        callback=callback_show_weights,
+                        tag="_checkbox_show_lbs_weights"
                     )
-
-        # window: LBS Control (Level 3) ==================================================================================================
-        if self.cfg.lbs and self.lbs_controller is not None:
-            with dpg.window(label="LBS Control", tag="_lbs_window", autosize=True, pos=(self.W-350, self.H//2 + 250)):
-                
-                # === 权重可视化 ===
-                def callback_show_weights(sender, app_data):
-                    self.show_lbs_weights = app_data
-                    self.need_update = True
-                
-                dpg.add_checkbox(
-                    label="Show LBS Weights",
-                    default_value=False,
-                    callback=callback_show_weights,
-                    tag="_checkbox_show_lbs_weights"
-                )
                 
                 dpg.add_separator()
                 
                 # === Jaw变换控制 ===
-                with dpg.collapsing_header(label="Jaw Transform", default_open=True):
+                with dpg.collapsing_header(label="Jaw Transform", default_open=False):
                     
                     # Translation
                     dpg.add_text("Translation (mm):")
@@ -1038,7 +1089,7 @@ class LocalViewer(Mini3DViewer):
                     dpg.add_text("Rotation (degrees):")
                     dpg.add_slider_float(
                         label="Pitch (Open/Close)",
-                        min_value=-24, max_value=0,
+                        min_value=-30, max_value=30,  # Centered at 0
                         default_value=0, format="%.1f",
                         callback=callback_lbs_transform,
                         tag="_slider_lbs_rot_pitch", width=200
