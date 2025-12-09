@@ -76,6 +76,8 @@ class Config(Mini3DViewerConfig):
     """Proximity threshold for seed selection"""
     lbs_small_step_radius: float = 5.0
     """Radius for graph connectivity in geodesic computation"""
+    debug: bool = False
+    """Enable debug output"""
 
 class LocalViewer(Mini3DViewer):
     def __init__(self, cfg: Config):
@@ -101,6 +103,11 @@ class LocalViewer(Mini3DViewer):
         if self.gaussians.binding is not None:
             print("Initializing FLAME parameters...")
             self.reset_flame_param()
+            
+            # 初始化FLAME mesh (必须在segment/LBS之前)
+            print("Initializing FLAME mesh for timestep 0...")
+            self.gaussians.select_mesh_by_timestep(0)
+            print(f"FLAME mesh initialized: verts shape = {self.gaussians.verts.shape if hasattr(self.gaussians, 'verts') else 'N/A'}")
         
         # === Segment Mesh功能 (Level 2) ===
         self.segment_meshes = {}  # {id: {'vertices': np.array, 'faces': np.array}}
@@ -119,6 +126,10 @@ class LocalViewer(Mini3DViewer):
                 print("[LBS] Error: --lbs requires --segment-path to be specified")
             elif len(self.segment_meshes) == 0:
                 print("[LBS] Error: No segments loaded, cannot enable LBS")
+            elif self.gaussians.binding is None:
+                print("[LBS] Error: No FLAME mesh available, cannot enable LBS")
+            elif not hasattr(self.gaussians, 'verts') or self.gaussians.verts is None:
+                print("[LBS] Error: FLAME mesh not initialized, cannot enable LBS")
             else:
                 print("[LBS] Initializing LBS controller...")
                 self._init_lbs_controller()
@@ -259,20 +270,40 @@ class LocalViewer(Mini3DViewer):
             return
         
         skin_verts = self.gaussians.verts.detach().cpu().numpy()[0]  # [N, 3]
-        print(f"[LBS] FLAME skin mesh: {len(skin_verts)} vertices")
         
-        # 3. 初始化LBS控制器(包含权重计算)
+        # Convert to mm for LBS computation (FLAME uses meters, LBS uses millimeters)
+        UNIT_SCALE = 1000.0  # m -> mm
+        skin_verts_mm = skin_verts * UNIT_SCALE
+        jaw_verts_mm = jaw_verts * UNIT_SCALE
+        skull_verts_mm = skull_verts * UNIT_SCALE
+        
+        if self.cfg.debug:
+            print(f"\n[LBS] === Unit Conversion (Debug) ===")
+            print(f"[LBS] Original (m): skin[{skin_verts.min():.4f}, {skin_verts.max():.4f}], jaw[{jaw_verts.min():.4f}, {jaw_verts.max():.4f}], skull[{skull_verts.min():.4f}, {skull_verts.max():.4f}]")
+            print(f"[LBS] Converted (mm): skin[{skin_verts_mm.min():.2f}, {skin_verts_mm.max():.2f}], jaw[{jaw_verts_mm.min():.2f}, {jaw_verts_mm.max():.2f}], skull[{skull_verts_mm.min():.2f}, {skull_verts_mm.max():.2f}]")
+            print(f"[LBS] ================================\n")
+        
+        # Store scale for later conversion back
+        self.lbs_unit_scale = UNIT_SCALE
+        
+        
+        # Initialize LBS controller with mm-scaled vertices
         lbs_config = LBSConfig(
             weight_damping=self.cfg.lbs_weight_damping,
+            small_step_radius=self.cfg.lbs_small_step_radius,
             proximity_threshold=self.cfg.lbs_proximity_threshold,
-            small_step_radius=self.cfg.lbs_small_step_radius
+            use_anatomical_regions=False,
+            max_seeds=300,
+            laplacian_iterations=5,
+            laplacian_alpha=0.5,
+            debug=self.cfg.debug  # Pass debug flag
         )
         
         try:
             self.lbs_controller = LBSController(
-                skin_vertices=skin_verts,
-                skull_vertices=skull_verts,
-                jaw_vertices=jaw_verts,
+                skin_vertices=skin_verts_mm,  # Use mm units
+                skull_vertices=skull_verts_mm,
+                jaw_vertices=jaw_verts_mm,
                 config=lbs_config
             )
             print("[LBS] LBS controller initialized successfully")
@@ -287,11 +318,11 @@ class LocalViewer(Mini3DViewer):
         if not self.cfg.lbs or self.lbs_controller is None:
             return
         
-        # 收集变换参数
+        # 收集变换参数 (slider值已经是mm,直接使用)
         translation = np.array([
-            dpg.get_value("_slider_lbs_trans_x"),
-            dpg.get_value("_slider_lbs_trans_y"),
-            dpg.get_value("_slider_lbs_trans_z")
+            dpg.get_value("_slider_lbs_trans_x"),  # mm
+            dpg.get_value("_slider_lbs_trans_y"),  # mm
+            dpg.get_value("_slider_lbs_trans_z")   # mm
         ])
         
         rotation = (
@@ -299,21 +330,31 @@ class LocalViewer(Mini3DViewer):
             np.radians(dpg.get_value("_slider_lbs_rot_yaw"))
         )
         
-        # 应用LBS变形
-        jaw_verts, skull_verts, skin_verts = self.lbs_controller.apply_transformation(
+        # 应用LBS变形 (在mm空间计算)
+        jaw_verts_mm, skull_verts_mm, skin_verts_mm = self.lbs_controller.apply_transformation(
             rotation=rotation,
             translation=translation
         )
         
+        # 🔧 转换回米(m)用于mesh更新
+        jaw_verts_m = jaw_verts_mm / self.lbs_unit_scale
+        skull_verts_m = skull_verts_mm / self.lbs_unit_scale
+        skin_verts_m = skin_verts_mm / self.lbs_unit_scale
+        
         # 更新FLAME skin mesh
-        self.gaussians.verts = torch.from_numpy(skin_verts).float().cuda().unsqueeze(0)  # Add batch dim [1, N, 3]
+        skin_verts_torch = torch.from_numpy(skin_verts_m).float().cuda().unsqueeze(0)  # [1, N, 3]
+        self.gaussians.verts = skin_verts_torch
+        
+        # **CRITICAL**: Update mesh properties to move Gaussian points
+        self.gaussians.update_mesh_properties(skin_verts_torch, self.gaussians.verts_cano)
         
         # 更新segment meshes的顶点
         skull_id, jaw_id = self.cfg.skull_jaw
-        self.segment_meshes[skull_id]['verts'] = torch.from_numpy(skull_verts).float().cuda().unsqueeze(0)
-        self.segment_meshes[jaw_id]['verts'] = torch.from_numpy(jaw_verts).float().cuda().unsqueeze(0)
+        self.segment_meshes[skull_id]['verts'] = torch.from_numpy(skull_verts_m).float().cuda().unsqueeze(0)
+        self.segment_meshes[jaw_id]['verts'] = torch.from_numpy(jaw_verts_m).float().cuda().unsqueeze(0)
         
         self.need_update = True
+
 
 
     def refresh_stat(self):
@@ -953,13 +994,22 @@ class LocalViewer(Mini3DViewer):
                     # Handle weight visualization for FLAME mesh
                     if self.cfg.lbs and self.show_lbs_weights and self.lbs_controller is not None:
                         # Show LBS weights as heat map
-                        weights_jaw = self.lbs_controller.weights[:, 0]  # Jaw weights
-                        weights_jaw_tensor = torch.from_numpy(weights_jaw).float().cuda()
+                        weights_jaw = self.lbs_controller.weights[:, 0]  # Jaw weights [N_verts]
                         
-                        # Use colormap for visualization
+                        # Use colormap for visualization  
                         cmap = matplotlib.colormaps["jet"]
-                        weights_colors = torch.from_numpy(cmap(weights_jaw)[:, :3]).float().cuda()
-                        face_colors_weights = weights_colors[self.gaussians.faces].mean(dim=1, keepdim=True)  # (F, 1, 3)
+                        weights_colors_np = cmap(weights_jaw)[:, :3]  # [N_verts, 3]
+                        weights_colors = torch.from_numpy(weights_colors_np).float().cuda()
+                        
+                        # CRITICAL: Face colors must be [1, N_faces, 3] for renderer
+                        # Map vertex colors to face colors by averaging vertex colors of each face
+                        n_faces = self.gaussians.faces.shape[0]
+                        face_colors_weights = torch.zeros(1, n_faces, 3, device='cuda')
+                        
+                        for i in range(n_faces):
+                            v0, v1, v2 = self.gaussians.faces[i]
+                            # Average the colors of the three vertices
+                            face_colors_weights[0, i] = (weights_colors[v0] + weights_colors[v1] + weights_colors[v2]) / 3.0
                         
                         out_dict = self.mesh_renderer.render_from_camera(self.gaussians.verts, self.gaussians.faces, cam, face_colors=face_colors_weights)
                     else:

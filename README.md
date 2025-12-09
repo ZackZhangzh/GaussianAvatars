@@ -17,6 +17,6 @@ python local_viewer.py  \
 --transform-path ${TRANS_PATH} \
 --lbs \
 --skull-jaw 4 5 \
-
+--debug
 
 ```

@@ -45,13 +45,16 @@ class LBSConfig:
     """Front percentage of face considered jaw-influenced"""
     
     max_seeds: int = 300
-    """Maximum number of seed points for weight computation"""
+    """Maximum number of seeds per control group"""
     
-    laplacian_iterations: int = 2
+    laplacian_iterations: int = 5
     """Number of Laplacian smoothing iterations"""
     
-    laplacian_alpha: float = 0.3
-    """Laplacian smoothing factor (0=no smooth, 1=full average)"""
+    laplacian_alpha: float = 0.5
+    """Laplacian smoothing factor (0=no smoothing, 1=full smoothing)"""
+    
+    debug: bool = False
+    """Enable debug output"""
 
 
 class LBSController:
@@ -119,6 +122,46 @@ class LBSController:
             )
         
         print(f"[LBS] Found {len(self.jaw_seeds)} jaw seeds and {len(self.skull_seeds)} skull seeds")
+        
+        # Spatial diagnostics (only if debug enabled)
+        if self.config.debug:
+            print(f"\n[LBS] === Spatial Diagnostics (Debug) ===")
+            # Bounding boxes
+            skin_min, skin_max = self.skin_verts_orig.min(axis=0), self.skin_verts_orig.max(axis=0)
+            skin_center = (skin_min + skin_max) / 2
+            jaw_min, jaw_max = self.jaw_verts_orig.min(axis=0), self.jaw_verts_orig.max(axis=0)
+            jaw_center = (jaw_min + jaw_max) / 2
+            skull_min, skull_max = self.skull_verts_orig.min(axis=0), self.skull_verts_orig.max(axis=0)
+            skull_center = (skull_min + skull_max) / 2
+            
+            print(f"[LBS] Skin   bbox: [{skin_min[0]:.3f}, {skin_min[1]:.3f}, {skin_min[2]:.3f}] to [{skin_max[0]:.3f}, {skin_max[1]:.3f}, {skin_max[2]:.3f}], center: [{skin_center[0]:.3f}, {skin_center[1]:.3f}, {skin_center[2]:.3f}]")
+            print(f"[LBS] Jaw    bbox: [{jaw_min[0]:.3f}, {jaw_min[1]:.3f}, {jaw_min[2]:.3f}] to [{jaw_max[0]:.3f}, {jaw_max[1]:.3f}, {jaw_max[2]:.3f}], center: [{jaw_center[0]:.3f}, {jaw_center[1]:.3f}, {jaw_center[2]:.3f}]")
+            print(f"[LBS] Skull  bbox: [{skull_min[0]:.3f}, {skull_min[1]:.3f}, {skull_min[2]:.3f}] to [{skull_max[0]:.3f}, {skull_max[1]:.3f}, {skull_max[2]:.3f}], center: [{skull_center[0]:.3f}, {skull_center[1]:.3f}, {skull_center[2]:.3f}]")
+            
+            # Distance analysis
+            tree_jaw = KDTree(self.jaw_verts_orig)
+            tree_skull = KDTree(self.skull_verts_orig)
+            dists_to_jaw, _ = tree_jaw.query(self.skin_verts_orig)
+            dists_to_skull, _ = tree_skull.query(self.skin_verts_orig)
+            
+            print(f"[LBS] Distance to Jaw  - min: {dists_to_jaw.min():.3f}, median: {np.median(dists_to_jaw):.3f}, max: {dists_to_jaw.max():.3f}")
+            print(f"[LBS] Distance to Skull - min: {dists_to_skull.min():.3f}, median: {np.median(dists_to_skull):.3f}, max: {dists_to_skull.max():.3f}")
+            print(f"[LBS] Proximity threshold: {self.config.proximity_threshold:.3f}")
+            print(f"[LBS] Skin points within threshold - jaw: {(dists_to_jaw < self.config.proximity_threshold).sum()}/{len(self.skin_verts_orig)}, skull: {(dists_to_skull < self.config.proximity_threshold).sum()}/{len(self.skin_verts_orig)}")
+            
+            # Seed spatial distribution
+            if len(self.jaw_seeds) > 0:
+                jaw_seed_verts = self.skin_verts_orig[self.jaw_seeds]
+                jaw_seed_center = jaw_seed_verts.mean(axis=0)
+                print(f"[LBS] Jaw seeds   - center: [{jaw_seed_center[0]:.3f}, {jaw_seed_center[1]:.3f}, {jaw_seed_center[2]:.3f}], Y-range: [{jaw_seed_verts[:, 1].min():.3f}, {jaw_seed_verts[:, 1].max():.3f}]")
+            
+            if len(self.skull_seeds) > 0:
+                skull_seed_verts = self.skin_verts_orig[self.skull_seeds]
+                skull_seed_center = skull_seed_verts.mean(axis=0)
+                print(f"[LBS] Skull seeds - center: [{skull_seed_center[0]:.3f}, {skull_seed_center[1]:.3f}, {skull_seed_center[2]:.3f}], Y-range: [{skull_seed_verts[:, 1].min():.3f}, {skull_seed_verts[:, 1].max():.3f}]")
+            
+            print(f"[LBS] =====================================\n")
+
         
         # 2. Compute geodesic weights
         self.weights = self._compute_geodesic_weights()
@@ -226,30 +269,74 @@ class LBSController:
     
     def _compute_geodesic_weights(self) -> np.ndarray:
         """Compute LBS weights using geodesic distances"""
+        import time
+        
         n = len(self.skin_verts_orig)
         
         # Build graph
         print("[LBS] Building connectivity graph...")
-        tree = KDTree(self.skin_verts_orig)
-        neighbors = tree.query_ball_point(self.skin_verts_orig, r=self.config.small_step_radius)
         
+        # 🐛 CHECK MESH SCALE
+        bbox_min = self.skin_verts_orig.min(axis=0)
+        bbox_max = self.skin_verts_orig.max(axis=0)
+        bbox_size = bbox_max - bbox_min
+        mesh_diagonal = np.linalg.norm(bbox_size)
+        print(f"[LBS] 🔍 Mesh bounding box: {bbox_size}")
+        print(f"[LBS] 🔍 Mesh diagonal: {mesh_diagonal:.4f}")
+        print(f"[LBS] 🔍 Configured radius: {self.config.small_step_radius:.4f}")
+        
+        # Auto-adjust radius if too large
+        recommended_radius = mesh_diagonal * 0.02  # 2% of diagonal
+        if self.config.small_step_radius > mesh_diagonal * 0.5:
+            print(f"[LBS] ⚠️  WARNING: Radius {self.config.small_step_radius:.4f} is TOO LARGE!")
+            print(f"[LBS] ⚠️  This will create a complete graph with {len(self.skin_verts_orig)**2} edges!")
+            print(f"[LBS] 💡 Recommended radius: {recommended_radius:.4f} (2% of diagonal)")
+            print(f"[LBS] 🔧 Auto-adjusting to recommended value...")
+            self.config.small_step_radius = recommended_radius
+        
+        t0 = time.time()
+        tree = KDTree(self.skin_verts_orig)
+        print(f"[LBS]   KDTree built in {time.time()-t0:.2f}s")
+        
+        t1 = time.time()
+        neighbors = tree.query_ball_point(self.skin_verts_orig, r=self.config.small_step_radius)
+        print(f"[LBS]   query_ball_point completed in {time.time()-t1:.2f}s")
+        
+        # Check neighbor statistics
+        neighbor_counts = [len(n_list) for n_list in neighbors]
+        avg_neighbors = np.mean(neighbor_counts)
+        max_neighbors = np.max(neighbor_counts)
+        print(f"[LBS]   Avg neighbors: {avg_neighbors:.1f}, Max: {max_neighbors}")
+        
+        t2 = time.time()
         adj_list = [[] for _ in range(n)]
         for i, idxs in enumerate(neighbors):
+            if i % 1000 == 0:
+                print(f"[LBS]   Building adjacency list: {i}/{n} ({100*i/n:.1f}%)")
             for neighbor in idxs:
                 if i == neighbor:
                     continue
                 w = np.linalg.norm(self.skin_verts_orig[i] - self.skin_verts_orig[neighbor])
                 adj_list[i].append((neighbor, w))
+        print(f"[LBS]   Adjacency list built in {time.time()-t2:.2f}s")
+
         
         # Compute geodesic distances
         print("[LBS] Computing geodesic distances...")
+        t3 = time.time()
         dist_jaw = self._dijkstra(n, adj_list, self.jaw_seeds)
+        print(f"[LBS]   Dijkstra (jaw) completed in {time.time()-t3:.2f}s")
+        
+        t4 = time.time()
         dist_skull = self._dijkstra(n, adj_list, self.skull_seeds)
+        print(f"[LBS]   Dijkstra (skull) completed in {time.time()-t4:.2f}s")
         
         # Compute weights with exponential decay
         print("[LBS] Computing weight decay...")
+        t5 = time.time()
         w_jaw = np.exp(-dist_jaw / self.config.weight_damping)
         w_skull = np.exp(-dist_skull / self.config.weight_damping)
+        print(f"[LBS]   Weight decay computed in {time.time()-t5:.2f}s")
         
         # Soft threshold with smooth transition
         soft_threshold = 0.001
@@ -264,6 +351,7 @@ class LBSController:
         
         # Apply Laplacian smoothing
         print("[LBS] Applying Laplacian smoothing...")
+        t6 = time.time()
         w_jaw = self._laplacian_smooth(
             w_jaw, adj_list, 
             iterations=self.config.laplacian_iterations,
@@ -274,10 +362,12 @@ class LBSController:
             iterations=self.config.laplacian_iterations,
             alpha=self.config.laplacian_alpha
         )
+        print(f"[LBS]   Laplacian smoothing completed in {time.time()-t6:.2f}s")
         
         # Stack weights: [jaw (moving), skull (static)]
         # Note: w_jaw + w_skull can be < 1.0, rest stays in place
         return np.stack([w_jaw, w_skull], axis=1)
+
     
     def _laplacian_smooth(
         self, 
