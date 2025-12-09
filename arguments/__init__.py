@@ -67,7 +67,10 @@ class ModelParams(ParamGroup):
         self.select_camera_id = -1
         self.use_mri_model = False
         self.mesh_path = "flame_model/assets/flame/head_template_mesh.obj"
+        self.points_per_face = 1  # Number of Gaussian points to initialize per mesh face
 
+
+        
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

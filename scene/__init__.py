@@ -154,6 +154,14 @@ class Scene:
         if gaussians.binding != None:
             self.gaussians.load_meshes(scene_info.train_meshes, scene_info.test_meshes,
                                        scene_info.tgt_train_meshes, scene_info.tgt_test_meshes)
+            
+            # Also load meshes for flame_reference if it exists
+            if hasattr(gaussians, 'flame_reference') and gaussians.flame_reference is not None:
+                print("Loading meshes for FLAME reference model...")
+                gaussians.flame_reference.load_meshes(
+                    scene_info.train_meshes, scene_info.test_meshes,
+                    scene_info.tgt_train_meshes, scene_info.tgt_test_meshes
+                )
 
         # create gaussians
         if self.loaded_iter:

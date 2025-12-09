@@ -29,7 +29,7 @@ class MRIGaussianModel(GaussianModel):
         not_finetune_flame_params=False,
         n_shape=300,
         n_expr=100,
-        
+
     ):
         super().__init__(sh_degree)
 
@@ -50,11 +50,19 @@ class MRIGaussianModel(GaussianModel):
         self.flame_param_orig = None
 
         # binding is initialized once the mesh topology is known
+        # if self.binding is None:
+        #     self.binding = torch.arange(len(self.flame_model.faces)).cuda()
+        #     self.binding_counter = torch.ones(
+        #         len(self.flame_model.faces), dtype=torch.int32
+        #     ).cuda()
+
+        points_per_face = 1
         if self.binding is None:
-            self.binding = torch.arange(len(self.flame_model.faces)).cuda()
+            num_faces = len(self.flame_model.faces)
+            self.binding = torch.arange(
+                num_faces).repeat_interleave(points_per_face).cuda()
             self.binding_counter = torch.ones(
-                len(self.flame_model.faces), dtype=torch.int32
-            ).cuda()
+                num_faces, dtype=torch.int32).cuda() * points_per_face
 
     def load_meshes(self, train_meshes, test_meshes, tgt_train_meshes, tgt_test_meshes):
         if self.flame_param is None:
@@ -104,6 +112,8 @@ class MRIGaussianModel(GaussianModel):
                 )
                 self.flame_param["rotation"][i] = torch.from_numpy(
                     mesh["rotation"])
+
+                
                 # self.flame_param["rotation"][i] = torch.tensor([0.0, 0.0, 0.0])
                 # self.flame_param["translation"][i] += torch.tensor(
                 #     [0.00059493, 0.03194094, - 0.05366429])

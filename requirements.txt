@@ -1,5 +1,6 @@
 tqdm
 numpy==1.22.3
+pillow==9.5.0
 matplotlib
 scipy
 chumpy
@@ -8,9 +9,10 @@ fvcore
 iopath
 plyfile
 tyro
-dearpygui
+dearpygui==1.9.0
 roma
+colour-science
 git+https://github.com/NVlabs/nvdiffrast
-#git+https://github.com/facebookresearch/pytorch3d.git
+git+https://github.com/facebookresearch/pytorch3d.git
 submodules/diff-gaussian-rasterization
 submodules/simple-knn

@@ -40,8 +40,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if dataset.use_mri_model:
             gaussians = MRIGaussianModel(dataset.sh_degree, dataset.mesh_path)
         else:
+            # gaussians = FlameGaussianModel(
+            #     dataset.sh_degree, dataset.disable_flame_static_offset, dataset.not_finetune_flame_params)
             gaussians = FlameGaussianModel(
-                dataset.sh_degree, dataset.disable_flame_static_offset, dataset.not_finetune_flame_params)
+                dataset.sh_degree, dataset.disable_flame_static_offset, dataset.not_finetune_flame_params, points_per_face=dataset.points_per_face)
         mesh_renderer = NVDiffRenderer()
     else:
         gaussians = GaussianModel(dataset.sh_degree)
@@ -317,7 +319,7 @@ def training_report(tb_writer, iteration, losses, elapsed, testing_iterations, s
                     gt_image = torch.clamp(
                         viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (
-                        idx % max(1,len(config['cameras']) // num_vis_img) == 0):
+                            idx % max(1, len(config['cameras']) // num_vis_img) == 0):
                         tb_writer.add_images(
                             config['name'] + "_{}/render".format(vis_ct), image[None], global_step=iteration)
                         error_image = error_map(image, gt_image)

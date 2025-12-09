@@ -1,8 +1,8 @@
-# 
-# Toyota Motor Europe NV/SA and its affiliated companies retain all intellectual 
-# property and proprietary rights in and to this software and related documentation. 
-# Any commercial use, reproduction, disclosure or distribution of this software and 
-# related documentation without an express license agreement from Toyota Motor Europe NV/SA 
+#
+# Toyota Motor Europe NV/SA and its affiliated companies retain all intellectual
+# property and proprietary rights in and to this software and related documentation.
+# Any commercial use, reproduction, disclosure or distribution of this software and
+# related documentation without an express license agreement from Toyota Motor Europe NV/SA
 # is strictly prohibited.
 #
 
@@ -19,7 +19,7 @@ from roma import rotmat_to_unitquat, quat_xyzw_to_wxyz
 
 
 class FlameGaussianModel(GaussianModel):
-    def __init__(self, sh_degree : int, disable_flame_static_offset=False, not_finetune_flame_params=False, n_shape=300, n_expr=100):
+    def __init__(self, sh_degree: int, disable_flame_static_offset=False, not_finetune_flame_params=False, n_shape=300, n_expr=100, points_per_face=1):
         super().__init__(sh_degree)
 
         self.disable_flame_static_offset = disable_flame_static_offset
@@ -28,7 +28,7 @@ class FlameGaussianModel(GaussianModel):
         self.n_expr = n_expr
 
         self.flame_model = FlameHead(
-            n_shape, 
+            n_shape,
             n_expr,
             add_teeth=True,
         ).cuda()
@@ -37,22 +37,32 @@ class FlameGaussianModel(GaussianModel):
 
         # binding is initialized once the mesh topology is known
         if self.binding is None:
-            self.binding = torch.arange(len(self.flame_model.faces)).cuda()
-            self.binding_counter = torch.ones(len(self.flame_model.faces), dtype=torch.int32).cuda()
-
+            # self.binding = torch.arange(len(self.flame_model.faces)).cuda()
+            # self.binding_counter = torch.ones(
+            #     len(self.flame_model.faces), dtype=torch.int32).cuda()
+            num_faces = len(self.flame_model.faces)
+            self.binding = (
+                torch.arange(num_faces).repeat_interleave(
+                    points_per_face).cuda()
+            )
+            self.binding_counter = (
+                torch.ones(num_faces, dtype=torch.int32).cuda() *
+                points_per_face
+            )
     def load_meshes(self, train_meshes, test_meshes, tgt_train_meshes, tgt_test_meshes):
         if self.flame_param is None:
             meshes = {**train_meshes, **test_meshes}
             tgt_meshes = {**tgt_train_meshes, **tgt_test_meshes}
             pose_meshes = meshes if len(tgt_meshes) == 0 else tgt_meshes
-            
+
             self.num_timesteps = max(pose_meshes) + 1  # required by viewers
             num_verts = self.flame_model.v_template.shape[0]
 
             if not self.disable_flame_static_offset:
                 static_offset = torch.from_numpy(meshes[0]['static_offset'])
                 if static_offset.shape[0] != num_verts:
-                    static_offset = torch.nn.functional.pad(static_offset, (0, 0, 0, num_verts - meshes[0]['static_offset'].shape[1]))
+                    static_offset = torch.nn.functional.pad(
+                        static_offset, (0, 0, 0, num_verts - meshes[0]['static_offset'].shape[1]))
             else:
                 static_offset = torch.zeros([num_verts, 3])
 
@@ -72,22 +82,29 @@ class FlameGaussianModel(GaussianModel):
 
             for i, mesh in pose_meshes.items():
                 self.flame_param['expr'][i] = torch.from_numpy(mesh['expr'])
-                self.flame_param['rotation'][i] = torch.from_numpy(mesh['rotation'])
-                self.flame_param['neck_pose'][i] = torch.from_numpy(mesh['neck_pose'])
-                self.flame_param['jaw_pose'][i] = torch.from_numpy(mesh['jaw_pose'])
-                self.flame_param['eyes_pose'][i] = torch.from_numpy(mesh['eyes_pose'])
-                self.flame_param['translation'][i] = torch.from_numpy(mesh['translation'])
+                self.flame_param['rotation'][i] = torch.from_numpy(
+                    mesh['rotation'])
+                self.flame_param['neck_pose'][i] = torch.from_numpy(
+                    mesh['neck_pose'])
+                self.flame_param['jaw_pose'][i] = torch.from_numpy(
+                    mesh['jaw_pose'])
+                self.flame_param['eyes_pose'][i] = torch.from_numpy(
+                    mesh['eyes_pose'])
+                self.flame_param['translation'][i] = torch.from_numpy(
+                    mesh['translation'])
                 # self.flame_param['dynamic_offset'][i] = torch.from_numpy(mesh['dynamic_offset'])
-            
+
             for k, v in self.flame_param.items():
                 self.flame_param[k] = v.float().cuda()
-            
-            self.flame_param_orig = {k: v.clone() for k, v in self.flame_param.items()}
+
+            self.flame_param_orig = {k: v.clone()
+                                     for k, v in self.flame_param.items()}
         else:
             # NOTE: not sure when this happens
-            import ipdb; ipdb.set_trace()
+            import ipdb
+            ipdb.set_trace()
             pass
-    
+
     def update_mesh_by_param_dict(self, flame_param):
         if 'shape' in flame_param:
             shape = flame_param['shape']
@@ -133,7 +150,7 @@ class FlameGaussianModel(GaussianModel):
             dynamic_offset=flame_param['dynamic_offset'][[timestep]],
         )
         self.update_mesh_properties(verts, verts_cano)
-    
+
     def update_mesh_properties(self, verts, verts_cano):
         faces = self.flame_model.faces
         triangles = verts[:, faces]
@@ -142,9 +159,11 @@ class FlameGaussianModel(GaussianModel):
         self.face_center = triangles.mean(dim=-2).squeeze(0)
 
         # orientation and scale
-        self.face_orien_mat, self.face_scaling = compute_face_orientation(verts.squeeze(0), faces.squeeze(0), return_scale=True)
+        self.face_orien_mat, self.face_scaling = compute_face_orientation(
+            verts.squeeze(0), faces.squeeze(0), return_scale=True)
         # self.face_orien_quat = matrix_to_quaternion(self.face_orien_mat)  # pytorch3d (WXYZ)
-        self.face_orien_quat = quat_xyzw_to_wxyz(rotmat_to_unitquat(self.face_orien_mat))  # roma
+        self.face_orien_quat = quat_xyzw_to_wxyz(
+            rotmat_to_unitquat(self.face_orien_mat))  # roma
 
         # for mesh rendering
         self.verts = verts
@@ -152,12 +171,13 @@ class FlameGaussianModel(GaussianModel):
 
         # for mesh regularization
         self.verts_cano = verts_cano
-    
+
     def compute_dynamic_offset_loss(self):
         # loss_dynamic = (self.flame_param['dynamic_offset'][[self.timestep]] - self.flame_param_orig['dynamic_offset'][[self.timestep]]).norm(dim=-1)
-        loss_dynamic = self.flame_param['dynamic_offset'][[self.timestep]].norm(dim=-1)
+        loss_dynamic = self.flame_param['dynamic_offset'][[
+            self.timestep]].norm(dim=-1)
         return loss_dynamic.mean()
-    
+
     def compute_laplacian_loss(self):
         # offset = self.flame_param['static_offset'] + self.flame_param['dynamic_offset'][[self.timestep]]
         offset = self.flame_param['dynamic_offset'][[self.timestep]]
@@ -170,7 +190,7 @@ class FlameGaussianModel(GaussianModel):
         diff = (lap_wo - lap_w) ** 2
         diff = diff.sum(dim=-1, keepdim=True)
         return diff.mean()
-    
+
     def training_setup(self, training_args):
         super().training_setup(training_args)
 
@@ -193,17 +213,20 @@ class FlameGaussianModel(GaussianModel):
             self.flame_param['jaw_pose'],
             self.flame_param['eyes_pose'],
         ]
-        param_pose = {'params': params, 'lr': training_args.flame_pose_lr, "name": "pose"}
+        param_pose = {'params': params,
+                      'lr': training_args.flame_pose_lr, "name": "pose"}
         self.optimizer.add_param_group(param_pose)
 
         # translation
         self.flame_param['translation'].requires_grad = True
-        param_trans = {'params': [self.flame_param['translation']], 'lr': training_args.flame_trans_lr, "name": "trans"}
+        param_trans = {'params': [self.flame_param['translation']],
+                       'lr': training_args.flame_trans_lr, "name": "trans"}
         self.optimizer.add_param_group(param_trans)
-        
+
         # expression
         self.flame_param['expr'].requires_grad = True
-        param_expr = {'params': [self.flame_param['expr']], 'lr': training_args.flame_expr_lr, "name": "expr"}
+        param_expr = {'params': [self.flame_param['expr']],
+                      'lr': training_args.flame_expr_lr, "name": "expr"}
         self.optimizer.add_param_group(param_expr)
 
         # # static_offset
@@ -231,16 +254,19 @@ class FlameGaussianModel(GaussianModel):
             # This operation overwrites the FLAME parameters loaded from the dataset.
             npz_path = Path(path).parent / "flame_param.npz"
             flame_param = np.load(str(npz_path))
-            flame_param = {k: torch.from_numpy(v).cuda() for k, v in flame_param.items()}
+            flame_param = {k: torch.from_numpy(
+                v).cuda() for k, v in flame_param.items()}
 
             self.flame_param = flame_param
-            self.num_timesteps = self.flame_param['expr'].shape[0]  # required by viewers
-        
+            # required by viewers
+            self.num_timesteps = self.flame_param['expr'].shape[0]
+
         if 'motion_path' in kwargs and kwargs['motion_path'] is not None:
             # When there is a motion sequence specified, load only dynamic parameters.
             motion_path = Path(kwargs['motion_path'])
             flame_param = np.load(str(motion_path))
-            flame_param = {k: torch.from_numpy(v).cuda() for k, v in flame_param.items() if v.dtype == np.float32}
+            flame_param = {k: torch.from_numpy(
+                v).cuda() for k, v in flame_param.items() if v.dtype == np.float32}
 
             self.flame_param = {
                 # keep the static parameters
@@ -255,10 +281,12 @@ class FlameGaussianModel(GaussianModel):
                 'expr': flame_param['expr'],
                 'dynamic_offset': flame_param['dynamic_offset'],
             }
-            self.num_timesteps = self.flame_param['expr'].shape[0]  # required by viewers
-        
+            # required by viewers
+            self.num_timesteps = self.flame_param['expr'].shape[0]
+
         if 'disable_fid' in kwargs and len(kwargs['disable_fid']) > 0:
-            mask = (self.binding[:, None] != kwargs['disable_fid'][None, :]).all(-1)
+            mask = (self.binding[:, None] !=
+                    kwargs['disable_fid'][None, :]).all(-1)
 
             self.binding = self.binding[mask]
             self._xyz = self._xyz[mask]
