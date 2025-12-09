@@ -224,27 +224,131 @@ class LocalViewer(Mini3DViewer):
         
         print(f"[Segment] Successfully loaded {len(self.segment_meshes)} segments: {list(self.segment_meshes.keys())}")
         
-        # 2. 应用可选的变换矩阵
-        if self.cfg.transform_path is not None:
-            print(f"[Segment] Applying transform from {self.cfg.transform_path}")
+        # 2. 应用alignment transform (CT native space -> FLAME canonical space)
+        self.segment_meshes_canonical = {}  # Cache for canonical space coordinates
+        
+        if self.cfg.transform_path:
             try:
-                transform_data = np.load(self.cfg.transform_path)
-                # 假设transform包含rotation和translation
-                if 'rotation' in transform_data and 'translation' in transform_data:
-                    rot = transform_data['rotation']
-                    trans = transform_data['translation']
-                    # Apply to all segments
-                    for seg_id in self.segment_meshes:
-                        verts = self.segment_meshes[seg_id]['verts'][0].cpu().numpy()  # Remove batch dim
-                        # 简单的刚体变换
-                        verts_transformed = verts @ rot.T + trans
-                        self.segment_meshes[seg_id]['verts'] = torch.from_numpy(verts_transformed).float().cuda().unsqueeze(0)
-                        self.segment_meshes[seg_id]['verts_orig'] = self.segment_meshes[seg_id]['verts'].clone()
-                    print(f"[Segment]   Applied transform to all segments")
+                transform = np.load(self.cfg.transform_path)
+                print(f"[Segment] Loading alignment transform from {self.cfg.transform_path}")
+                print(f"[Segment]   Available keys: {list(transform.keys())}")
+                
+                # Handle different transform file formats
+                if 'R' in transform and 't' in transform and 's' in transform:
+                    # Format 1: R, t, s (from mesh_align_to_flame.py)
+                    R = transform['R']
+                    t = transform['t']
+                    s = transform['s']
+                    print(f"[Segment]   Using R/t/s format")
+                elif 'rotation' in transform and 'translation' in transform:
+                    # Format 2: rotation, translation (legacy)
+                    R = transform['rotation']
+                    t = transform['translation']
+                    s = transform.get('scale', 1.0)
+                    print(f"[Segment]   Using rotation/translation format")
                 else:
-                    print(f"[Segment]   Warning: Transform file missing 'rotation' or 'translation' keys")
+                    available = list(transform.keys())
+                    raise KeyError(
+                        f"Transform file format not recognized.\n"
+                        f"  Available keys: {available}\n"
+                        f"  Expected: 'R'/'t'/'s' OR 'rotation'/'translation'"
+                    )
+                
+                print(f"[Segment]   Transform params: R{R.shape}, t{t.shape if hasattr(t, 'shape') else 'scalar'}, s={s}")
+
+                
+                for seg_id, seg_data in self.segment_meshes.items():
+                    verts_native = seg_data['verts_orig'][0].cpu().numpy()  # [N, 3] in CT space
+                    # Transform to FLAME canonical space
+                    verts_canonical = s * (R @ verts_native.T).T + t
+                    
+                    # Cache canonical space (aligned to FLAME template)
+                    self.segment_meshes_canonical[seg_id] = verts_canonical.copy()
+                    
+                    # Initially set to canonical (will apply global transform next)
+                    self.segment_meshes[seg_id]['verts'] = torch.from_numpy(verts_canonical).float().cuda().unsqueeze(0)
+                
+                print(f"[Segment]   Transformed segments to FLAME canonical space")
             except Exception as e:
                 print(f"[Segment] Warning: Failed to apply transform: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            # No transform: assume already in canonical space
+            for seg_id, seg_data in self.segment_meshes.items():
+                verts = seg_data['verts'][0].cpu().numpy()
+                self.segment_meshes_canonical[seg_id] = verts.copy()
+        
+        # 3. Apply FLAME's global translation to align with current timestep
+        self._sync_segment_global_transform()
+        
+        # Diagnostic output to debug alignment
+        if self.cfg.debug and self.gaussians.binding is not None:
+            timestep = getattr(self.gaussians, 'timestep', 0)
+            flame_trans = self.gaussians.flame_param['translation'][timestep].cpu().numpy()
+            flame_center = self.gaussians.verts[0].cpu().numpy().mean(axis=0)
+            
+            print(f"\n[Segment] === Coordinate Alignment Diagnostics ===")
+            print(f"[Segment] FLAME translation[{timestep}]: {flame_trans}")
+            print(f"[Segment] FLAME mesh center (global): [{flame_center[0]:.4f}, {flame_center[1]:.4f}, {flame_center[2]:.4f}]")
+            
+            for seg_id in list(self.segment_meshes.keys())[:2]:  # Only first 2 to avoid spam
+                seg_center_canonical = self.segment_meshes_canonical[seg_id].mean(axis=0)
+                seg_center_global = self.segment_meshes[seg_id]['verts'][0].cpu().numpy().mean(axis=0)
+                print(f"[Segment] Segment_{seg_id} center (canonical): [{seg_center_canonical[0]:.4f}, {seg_center_canonical[1]:.4f}, {seg_center_canonical[2]:.4f}]")
+                print(f"[Segment] Segment_{seg_id} center (global):    [{seg_center_global[0]:.4f}, {seg_center_global[1]:.4f}, {seg_center_global[2]:.4f}]")
+                
+                dist_canonical_to_flame = np.linalg.norm(seg_center_canonical - flame_center)
+                dist_global_to_flame = np.linalg.norm(seg_center_global - flame_center)
+                print(f"[Segment] Segment_{seg_id} distance to FLAME: canonical={dist_canonical_to_flame:.4f}, global={dist_global_to_flame:.4f}")
+            
+            print(f"[Segment] =======================================\n")
+        
+        print(f"[Segment]   Synced segments to FLAME global space")
+    
+    def _sync_segment_global_transform(self):
+        """
+        Synchronize segment global position with FLAME.
+        Applies FLAME's translation[timestep] to move segments from canonical to global space.
+        
+        Coordinate transform pipeline:
+          Segments: Native -> Alignment -> Canonical -> + translation -> Global
+          FLAME:    Template -> + shape -> Canonical -> + LBS(pose) -> + translation -> Global
+        
+        This ensures segments and FLAME are in the same global coordinate frame.
+        """
+        if not hasattr(self, 'segment_meshes') or not self.segment_meshes:
+            return
+        
+        if not hasattr(self, 'segment_meshes_canonical'):
+            # Fallback: no canonical cache, segments stay as-is
+            return
+        
+        
+        
+        # Get FLAME's global translation for current timestep
+        if self.gaussians.binding is None or not hasattr(self.gaussians, 'flame_param'):
+            # No FLAME parameters: segments stay in canonical space
+            return
+        
+        # Use gaussians.timestep if available, otherwise use 0 (single timestep mode)
+        timestep = getattr(self.gaussians, 'timestep', 0)
+        flame_translation = self.gaussians.flame_param['translation'][timestep].cpu().numpy()  # [3]
+        
+        # Apply same translation to all segments
+        for seg_id in self.segment_meshes:
+            if seg_id not in self.segment_meshes_canonical:
+                continue
+            
+            # Start from canonical space
+            verts_canonical = self.segment_meshes_canonical[seg_id]
+            
+            # Add FLAME's global translation
+            verts_global = verts_canonical + flame_translation
+            
+            # Update segment vertices to global space
+            self.segment_meshes[seg_id]['verts'] = torch.from_numpy(verts_global).float().cuda().unsqueeze(0)
+    
     
     def _init_lbs_controller(self):
         """
@@ -348,10 +452,26 @@ class LocalViewer(Mini3DViewer):
         # **CRITICAL**: Update mesh properties to move Gaussian points
         self.gaussians.update_mesh_properties(skin_verts_torch, self.gaussians.verts_cano)
         
-        # 更新segment meshes的顶点
+        # Update segment meshes vertices
         skull_id, jaw_id = self.cfg.skull_jaw
-        self.segment_meshes[skull_id]['verts'] = torch.from_numpy(skull_verts_m).float().cuda().unsqueeze(0)
-        self.segment_meshes[jaw_id]['verts'] = torch.from_numpy(jaw_verts_m).float().cuda().unsqueeze(0)
+        
+        # Get current FLAME translation for global alignment
+        flame_translation = self.gaussians.flame_param['translation'][self.timestep].cpu().numpy()
+        
+        # Skull: Update canonical position + apply global translation
+        self.segment_meshes_canonical[skull_id] = skull_verts_m.copy()
+        self.segment_meshes[skull_id]['verts'] = torch.from_numpy(skull_verts_m + flame_translation).float().cuda().unsqueeze(0)
+        
+        # Jaw: LBS deformed + apply global translation
+        self.segment_meshes_canonical[jaw_id] = jaw_verts_m.copy()
+        self.segment_meshes[jaw_id]['verts'] = torch.from_numpy(jaw_verts_m + flame_translation).float().cuda().unsqueeze(0)
+        
+        # Sync other segments (non-LBS) to maintain global alignment
+        for seg_id in self.segment_meshes:
+            if seg_id not in [skull_id, jaw_id]:
+                # These segments don't deform, just follow FLAME's global position
+                verts_global = self.segment_meshes_canonical[seg_id] + flame_translation
+                self.segment_meshes[seg_id]['verts'] = torch.from_numpy(verts_global).float().cuda().unsqueeze(0)
         
         self.need_update = True
 
@@ -956,9 +1076,22 @@ class LocalViewer(Mini3DViewer):
                 if dpg.is_item_hovered("_slider_timestep"):
                     self.timestep = min(max(self.timestep - delta, 0), self.num_timesteps - 1)
                     dpg.set_value("_slider_timestep", self.timestep)
-                    self.gaussians.select_mesh_by_timestep(self.timestep)
-                    self.need_update = True
+                    # Call the new method to handle timestep change and sync
+                    self.select_mesh_by_timestep(self.timestep)
             dpg.add_mouse_wheel_handler(callback=callbackmouse_wheel_slider)
+
+    def select_mesh_by_timestep(self, timestep_index):
+        if timestep_index < 0 or timestep_index >= len(self.gaussians.tid2paths): # Assuming tid2paths is part of self.gaussians
+            return
+        
+        self.timestep = timestep_index
+        self.gaussians.select_mesh_by_timestep(timestep_index)
+        
+        # Sync segment positions with FLAME's new global transform
+        if hasattr(self, 'segment_meshes') and self.segment_meshes:
+            self._sync_segment_global_transform()
+        
+        self.need_update = True
 
     def prepare_camera(self):
         @dataclass
