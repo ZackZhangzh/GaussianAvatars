@@ -194,6 +194,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            # DEBUG: Print mesh param updates (for MeshGaussianModel only)
+            if hasattr(opt, 'mesh_debug_interval') and opt.mesh_debug_interval > 0:
+                if iteration % opt.mesh_debug_interval == 0 and hasattr(gaussians, 'mesh_param'):
+                    rot = gaussians.mesh_param['rotation'][0].detach().cpu().numpy()
+                    trans = gaussians.mesh_param['translation'][0].detach().cpu().numpy()
+                    # Check gradient status
+                    rot_grad = gaussians.mesh_param['rotation'].grad
+                    trans_grad = gaussians.mesh_param['translation'].grad
+                    rot_has_grad = rot_grad is not None and rot_grad.abs().sum() > 0
+                    trans_has_grad = trans_grad is not None and trans_grad.abs().sum() > 0
+                    print(f"[DEBUG mesh] iter={iteration} "
+                          f"rot=[{rot[0]:.4f}, {rot[1]:.4f}, {rot[2]:.4f}] "
+                          f"trans=[{trans[0]:.6f}, {trans[1]:.6f}, {trans[2]:.6f}] "
+                          f"| grad: rot={rot_has_grad}, trans={trans_has_grad}")
+
             # Log and save
             training_report(tb_writer, iteration, losses, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):

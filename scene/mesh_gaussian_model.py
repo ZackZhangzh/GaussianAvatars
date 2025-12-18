@@ -30,7 +30,7 @@ class MeshGaussianModel(GaussianModel):
     """
     
     def __init__(self, mesh_path: str, sh_degree: int, 
-                 not_optimize_mesh_transform: bool = True):
+                 not_optimize_mesh_transform: bool = False):
         """
         Initialize MeshGaussianModel with custom mesh.
         
@@ -172,33 +172,42 @@ class MeshGaussianModel(GaussianModel):
         """
         Convert Euler angles (XYZ convention) to rotation matrix.
         
+        IMPORTANT: Uses torch.stack() instead of torch.tensor() to preserve gradients.
+        
         Args:
             euler_angles: [3] tensor (rx, ry, rz in radians)
         
         Returns:
-            R: [3, 3] rotation matrix
+            R: [3, 3] rotation matrix (differentiable w.r.t. euler_angles)
         """
-        # Use torch implementation to avoid scipy dependency
         rx, ry, rz = euler_angles[0], euler_angles[1], euler_angles[2]
         
-        # Rotation matrices for each axis
-        Rx = torch.tensor([
-            [1, 0, 0],
-            [0, torch.cos(rx), -torch.sin(rx)],
-            [0, torch.sin(rx), torch.cos(rx)]
-        ], device=euler_angles.device, dtype=euler_angles.dtype)
+        # Use zeros/ones with same device/dtype (preserves computation graph)
+        zero = torch.zeros(1, device=euler_angles.device, dtype=euler_angles.dtype).squeeze()
+        one = torch.ones(1, device=euler_angles.device, dtype=euler_angles.dtype).squeeze()
         
-        Ry = torch.tensor([
-            [torch.cos(ry), 0, torch.sin(ry)],
-            [0, 1, 0],
-            [-torch.sin(ry), 0, torch.cos(ry)]
-        ], device=euler_angles.device, dtype=euler_angles.dtype)
+        cos_rx, sin_rx = torch.cos(rx), torch.sin(rx)
+        cos_ry, sin_ry = torch.cos(ry), torch.sin(ry)
+        cos_rz, sin_rz = torch.cos(rz), torch.sin(rz)
         
-        Rz = torch.tensor([
-            [torch.cos(rz), -torch.sin(rz), 0],
-            [torch.sin(rz), torch.cos(rz), 0],
-            [0, 0, 1]
-        ], device=euler_angles.device, dtype=euler_angles.dtype)
+        # Build rotation matrices using stack (preserves gradients!)
+        Rx = torch.stack([
+            torch.stack([one, zero, zero]),
+            torch.stack([zero, cos_rx, -sin_rx]),
+            torch.stack([zero, sin_rx, cos_rx])
+        ])
+        
+        Ry = torch.stack([
+            torch.stack([cos_ry, zero, sin_ry]),
+            torch.stack([zero, one, zero]),
+            torch.stack([-sin_ry, zero, cos_ry])
+        ])
+        
+        Rz = torch.stack([
+            torch.stack([cos_rz, -sin_rz, zero]),
+            torch.stack([sin_rz, cos_rz, zero]),
+            torch.stack([zero, zero, one])
+        ])
         
         # Combined rotation: R = Rz @ Ry @ Rx (XYZ convention)
         R = Rz @ Ry @ Rx
@@ -208,39 +217,49 @@ class MeshGaussianModel(GaussianModel):
         """
         Setup optimizer for training.
         
-        By default, mesh transform (rotation/translation) is frozen.
-        Can be enabled via training_args.optimize_mesh_transform.
+        By default, mesh transform (rotation/translation) is optimized.
+        Can be disabled via --not_optimize_mesh_transform flag.
+        
+        Uses separate learning rates for rotation and translation:
+            - mesh_pose_lr (default 1e-5): for rotation
+            - mesh_trans_lr (default 1e-6): for translation
         
         Args:
             training_args: Optimization parameters
         """
         super().training_setup(training_args)
         
-        # Default: freeze mesh transform (similar to not_finetune_flame_params)
+        # Check if mesh transform optimization is disabled
         if self.not_optimize_mesh_transform:
             print("[MeshGaussianModel] Mesh transform frozen (rotation/translation fixed)")
             return
         
-        # Optional: allow mesh optimization
+        # Enable mesh optimization with split learning rates (mirroring FLAME)
         self.mesh_param['rotation'].requires_grad = True
         self.mesh_param['translation'].requires_grad = True
         
-        params = [
-            self.mesh_param['rotation'],
-            self.mesh_param['translation'],
-        ]
+        # Get learning rates from training_args (parallel to flame_pose_lr/flame_trans_lr)
+        mesh_pose_lr = getattr(training_args, 'mesh_pose_lr', 1e-5)
+        mesh_trans_lr = getattr(training_args, 'mesh_trans_lr', 1e-6)
         
-        # Use custom LR if specified, otherwise default 1e-5
-        mesh_lr = getattr(training_args, 'mesh_transform_lr', 1e-5)
-        
-        param_group = {
-            'params': params,
-            'lr': mesh_lr,
-            'name': 'mesh_transform'
+        # Add rotation parameter group (similar to FLAME pose params)
+        param_rotation = {
+            'params': [self.mesh_param['rotation']],
+            'lr': mesh_pose_lr,
+            'name': 'mesh_rotation'
         }
-        self.optimizer.add_param_group(param_group)
+        self.optimizer.add_param_group(param_rotation)
         
-        print(f"[MeshGaussianModel] Added mesh transform to optimizer (lr={mesh_lr})")
+        # Add translation parameter group (similar to FLAME trans params)
+        param_translation = {
+            'params': [self.mesh_param['translation']],
+            'lr': mesh_trans_lr,
+            'name': 'mesh_translation'
+        }
+        self.optimizer.add_param_group(param_translation)
+        
+        print(f"[MeshGaussianModel] Mesh optimization enabled: "
+              f"rotation_lr={mesh_pose_lr}, translation_lr={mesh_trans_lr}")
     
     def save_ply(self, path):
         """

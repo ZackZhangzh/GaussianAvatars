@@ -59,7 +59,7 @@ class ModelParams(ParamGroup):
         self.disable_flame_static_offset = False
         self.not_finetune_flame_params = False
         self.mesh_path = ""  # Path to custom mesh for MeshGaussianModel (no shorthand to avoid conflict with -m/model_path)
-        self.optimize_mesh_transform = False  # Whether to optimize mesh rotation/translation
+        self.optimize_mesh_transform = True  # Whether to optimize mesh rotation/translation (default: enabled)
         self.select_camera_id = -1
         super().__init__(parser, "Loading Parameters", sentinel)
 

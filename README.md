@@ -38,16 +38,21 @@ python train.py \
 -m ${PROJECT_ROOT}/output/gaussian/${OUTPUT} \
 --iterations ${ITER} --interval 10000 \
 --eval --bind_to_mesh --white_background \
---mesh_path ${MESH_PATH} --port 60000
+--mesh_path ${MESH_PATH} --port 60000 \
+--optimize_mesh_transform --mesh_debug_interval 100 \
+--mesh_pose_lr 1e-3 --mesh_trans_lr 1e-3
 
 
 
-
+PROJECT_ROOT=${HOME}/Avatars
 SUBJECT=rigid_zhang_1111
 SEQUENCE=EMO-1
 OUTPUT=rigid_MESH_${SUBJECT}_${SEQUENCE}
 ITER=100000
-MESH_PATH=/home/zhihao/Publications/data/MRI/facescan/user_mesh_aligned.obj
+MESH_PATH=${PROJECT_ROOT}/data/MRI/facescan/user_mesh_aligned.obj
+
+
+
 
 ```
 
