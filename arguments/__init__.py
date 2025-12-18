@@ -58,6 +58,8 @@ class ModelParams(ParamGroup):
         self.bind_to_mesh = False
         self.disable_flame_static_offset = False
         self.not_finetune_flame_params = False
+        self.mesh_path = ""  # Path to custom mesh for MeshGaussianModel (no shorthand to avoid conflict with -m/model_path)
+        self.optimize_mesh_transform = False  # Whether to optimize mesh rotation/translation
         self.select_camera_id = -1
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -106,6 +108,11 @@ class OptimizationParams(ParamGroup):
         self.lambda_dynamic_offset = 0.
         self.lambda_laplacian = 0.
         self.lambda_dynamic_offset_std = 0  #1.
+
+        # MeshGaussianModel optimization (parallel to FLAME params)
+        self.mesh_pose_lr = 1e-5      # Learning rate for mesh rotation (same as flame_pose_lr)
+        self.mesh_trans_lr = 1e-6     # Learning rate for mesh translation (same as flame_trans_lr)
+        self.mesh_debug_interval = 1000  # Print mesh param debug info every N iterations (0 to disable)
 
         super().__init__(parser, "Optimization Parameters")
 

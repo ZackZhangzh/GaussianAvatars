@@ -21,6 +21,7 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.cameras import Camera
 from scene.gaussian_model import GaussianModel
 from scene.flame_gaussian_model import FlameGaussianModel
+from scene.mesh_gaussian_model import MeshGaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 from utils.general_utils import PILtoTorch
@@ -135,8 +136,8 @@ class Scene:
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
         
-        # process meshes
-        if gaussians.binding != None:
+        # process meshes (only for FlameGaussianModel)
+        if isinstance(gaussians, FlameGaussianModel):
             self.gaussians.load_meshes(scene_info.train_meshes, scene_info.test_meshes, 
                                        scene_info.tgt_train_meshes, scene_info.tgt_test_meshes)
         

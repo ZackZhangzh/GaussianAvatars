@@ -38,6 +38,15 @@ from vhap.model.lbs import vertices2landmarks
 sys.path.insert(0, str(Path(__file__).parent.parent / "GaussianAvatars"))
 from scene.dataset_readers import readMeshesFromTransforms
 
+# Additional imports for manual fine-tuning
+try:
+    import dearpygui.dearpygui as dpg
+    from utils.viewer_utils import Mini3DViewer, Mini3DViewerConfig
+    from mesh_renderer import NVDiffRenderer
+except ImportError:
+    pass  # Will handle gracefully if missing during execution check
+
+
 
 # Landmark format constants
 LANDMARK_FORMAT_68_TO_51_INDICES = np.arange(17, 68, dtype=int)  # Remove face contour [0:17]
@@ -90,6 +99,13 @@ class AlignmentConfig:
     
     save_visualizations: bool = True
     """Whether to generate PNG visualizations (requires pyglet)"""
+
+    manual_fine_tune: bool = False
+    """Whether to enable manual fine-tuning GUI after initial alignment"""
+
+    load_alignment_path: Optional[Path] = None
+    """Optional path to an existing alignment_transform.npz to resume fine-tuning from"""
+
 
 
 @dataclass
@@ -1095,33 +1111,25 @@ def save_comprehensive_outputs(
     mesh_dir = output_dir / "meshes"
     lmk_dir = output_dir / "landmarks"
     transform_dir = output_dir / "transform"
-    log_dir = output_dir / "logs"
     
-    for d in [mesh_dir, lmk_dir, transform_dir, log_dir]:
+    for d in [mesh_dir, lmk_dir, transform_dir]:
         d.mkdir(parents=True, exist_ok=True)
     
-    print(f"\nSaving comprehensive outputs to: {output_dir}")
-    print("="*60)
+    print(f"\nSaving outputs to: {output_dir}")
     
     # 1. Save meshes
-    print("\n[1/4] Saving meshes...")
     _save_meshes(mesh_dir, result)
     
     # 2. Save landmarks
-    print("\n[2/4] Saving landmarks...")
     _save_landmarks(lmk_dir, result)
     
     # 3. Save transformation
-    print("\n[3/4] Saving transformation data...")
     _save_transformation(transform_dir, result)
     
-    # 4. Save alignment report
-    print("\n[4/4] Generating alignment report...")
-    _save_alignment_report(log_dir, cfg, result)
+    # 4. Save alignment report (save at root for visibility)
+    _save_alignment_report(output_dir, cfg, result)
     
-    print("\n" + "="*60)
-    print(f"✓ All outputs saved successfully!")
-    print("="*60)
+    print(f"  ✓ Saved alignment report to {output_dir / 'alignment_report.txt'}")
 
 
 def _save_meshes(mesh_dir: Path, result: AlignmentResult) -> None:
@@ -1153,7 +1161,6 @@ def _save_meshes(mesh_dir: Path, result: AlignmentResult) -> None:
         result.flame_mesh_faces,
         mesh_dir / "flame_canonical_template.obj"
     )
-    print(f"  ✓ {mesh_dir / 'flame_canonical_template.obj'}")
     
     # FLAME mesh with static_offset (if available)
     if result.flame_mesh_with_offset_vertices is not None:
@@ -1170,31 +1177,30 @@ def _save_meshes(mesh_dir: Path, result: AlignmentResult) -> None:
         result.user_mesh_faces,
         mesh_dir / "user_mesh_original.obj"
     )
-    print(f"  ✓ {mesh_dir / 'user_mesh_original.obj'}")
     
+    # User mesh aligned
     # User mesh aligned
     export_obj_without_material(
         result.user_mesh_aligned_vertices,
         result.user_mesh_faces,
         mesh_dir / "user_mesh_aligned.obj"
     )
-    print(f"  ✓ {mesh_dir / 'user_mesh_aligned.obj'}")
+    
+    print(f"  ✓ Saved 3 mesh files to {mesh_dir}/")
 
 
 def _save_landmarks(lmk_dir: Path, result: AlignmentResult) -> None:
     """Save landmark arrays in NPY format."""
     
     np.save(lmk_dir / "flame_landmarks.npy", result.flame_landmarks)
-    print(f"  ✓ {lmk_dir / 'flame_landmarks.npy'}")
     
     np.save(lmk_dir / "user_landmarks_original.npy", result.user_landmarks_original)
-    print(f"  ✓ {lmk_dir / 'user_landmarks_original.npy'}")
     
     np.save(lmk_dir / "user_landmarks_aligned.npy", result.user_landmarks_aligned)
-    print(f"  ✓ {lmk_dir / 'user_landmarks_aligned.npy'}")
     
     np.save(lmk_dir / "per_landmark_errors.npy", result.per_landmark_errors)
-    print(f"  ✓ {lmk_dir / 'per_landmark_errors.npy'}")
+    
+    print(f"  ✓ Saved 4 landmark files to {lmk_dir}/")
 
 
 def _save_transformation(transform_dir: Path, result: AlignmentResult) -> None:
@@ -1443,6 +1449,437 @@ def visualize_results(
         print(f"  ✗ Could not generate interactive HTML viewer: {e}")
 
 
+class FineTuningViewer(Mini3DViewer):
+    """
+    Interactive viewer for manual fine-tuning of mesh alignment.
+    Allows real-time adjustment of scale, rotation, and translation.
+    """
+    def __init__(self, cfg: AlignmentConfig, result: AlignmentResult):
+        # Initialize base viewer configuration
+        try:
+            import dearpygui.dearpygui as dpg
+            from dataclasses import dataclass
+            # We don't import Mini3DViewerConfig globally to avoid circular deps risks 
+            # if utils aren't perfectly set up, but assumed available here.
+        except ImportError:
+            raise ImportError("Manual fine-tuning requires 'dearpygui' and 'utils.viewer_utils'.")
+
+        # Define a local config class that includes cam_convention
+        # (Mini3DViewer expects cfg.cam_convention, but base Mini3DViewerConfig doesn't have it)
+        @dataclass
+        class FineTuningConfig(Mini3DViewerConfig):
+             cam_convention: str = "opencv"
+
+        # Create a standard config for the viewer
+        viewer_cfg = FineTuningConfig(
+            W=1600, 
+            H=900, 
+            radius=1.5, 
+            fovy=30,
+            cam_convention="opencv"
+        )
+        
+        # Initialize state variables BEFORE super().__init__ because define_gui needs them
+        self.align_cfg = cfg
+        self.result = result
+        
+        # Initialize transformation parameters from the auto-alignment result
+        self.scale = float(result.scale_factor)
+        
+        # Convert rotation matrix to Euler angles (degrees) for intuitive sliders
+        r = R.from_matrix(result.rotation_matrix)
+        self.rot_euler = r.as_euler('xyz', degrees=True).tolist() # [x, y, z]
+        
+        self.translation = result.translation_vector.tolist() # [x, y, z]
+
+        # History for Undo/Redo
+        self.history = []
+        self.initial_state = {
+            'scale': self.scale,
+            'rot': list(self.rot_euler),
+            'trans': list(self.translation)
+        }
+        
+        # Call base class init (which calls define_gui)
+        super().__init__(viewer_cfg, title="Manual Mesh Alignment Fine-Tuning")
+        
+        # Initialize renderer
+        print("  Initializing NVDiffRenderer for fine-tuning...")
+        self.mesh_renderer = NVDiffRenderer(use_opengl=False) # Use CUDA rasterizer
+        
+        # Prepare Meshes for Rendering
+        # 1. FLAME Reference (Static, Light Gray, Transparent)
+        self.flame_verts = torch.from_numpy(result.flame_mesh_vertices).float().cuda().unsqueeze(0) # [1, V, 3]
+        faces = result.flame_mesh_faces.numpy() if hasattr(result.flame_mesh_faces, 'numpy') else result.flame_mesh_faces
+        if isinstance(faces, torch.Tensor): faces = faces.cpu().numpy()
+        self.flame_faces = torch.from_numpy(faces).int().cuda()
+        
+        self.flame_color = torch.tensor([0.7, 0.7, 0.7, 0.5]).cuda() # RGBA
+        self.flame_face_colors = self.flame_color[:3].view(1, 1, 3).expand(1, self.flame_faces.shape[0], 3)
+        
+        # 2. User Mesh (Dynamic, Light Green, Transparent)
+        self.user_verts_orig = torch.from_numpy(result.user_mesh_vertices).float().cuda().unsqueeze(0) # [1, V, 3]
+        faces_u = result.user_mesh_faces
+        self.user_faces = torch.from_numpy(faces_u).int().cuda()
+        
+        self.user_color = torch.tensor([0.2, 0.8, 0.2, 0.6]).cuda() # RGBA
+        self.user_face_colors = self.user_color[:3].view(1, 1, 3).expand(1, self.user_faces.shape[0], 3)
+        
+        # Current transformed user vertices (will be updated)
+        self.user_verts_transformed = self.user_verts_orig.clone()
+        
+        # Initial update
+        self.update_transform_logical()
+        
+        print("  Fine-tuning viewer initialized. Please consult the GUI window.")
+
+    def update_transform_logical(self):
+        """Update internal transformation matrices and mesh vertices based on current parameters."""
+        # 1. Reconstruct Rotation Matrix
+        r = R.from_euler('xyz', self.rot_euler, degrees=True)
+        self.current_R = r.as_matrix()
+        
+        # 2. Reconstruct Transform Matrix (T(x) = s * R * x + t)
+        self.current_transform = np.eye(4)
+        self.current_transform[:3, :3] = self.scale * self.current_R
+        self.current_transform[:3, 3] = self.translation
+        
+        # 3. Apply to User Mesh Vertices (for rendering)
+        # v_new = (T @ v_old^T)^T
+        T_torch = torch.from_numpy(self.current_transform).float().cuda()
+        
+        # Homogeneous coordinate transform
+        # user_verts_orig: [1, V, 3] -> [V, 3]
+        v = self.user_verts_orig[0] 
+        v_homo = torch.cat([v, torch.ones_like(v[:, :1])], dim=1) # [V, 4]
+        v_new = (T_torch @ v_homo.T).T # [V, 4]
+        
+        self.user_verts_transformed = v_new[:, :3].unsqueeze(0) # [1, V, 3]
+
+    def define_gui(self):
+        super().define_gui()
+        
+        # Create Control Window
+        with dpg.window(label="Fine-Tuning Controls", tag="_control_window", width=350, height=500, pos=(20, 20)):
+            dpg.add_text("Manual Alignment Fine-Tuning", color=(0, 255, 255))
+            dpg.add_separator()
+            
+            dpg.add_text("Instructions:")
+            dpg.add_text("- Adjust sliders to align Green Mesh (User) to Gray Mesh (FLAME)")
+            dpg.add_text("- Use Mouse Left/Right to Rotate/Pan Camera")
+            dpg.add_text("- Scroll to Zoom")
+            dpg.add_separator()
+            
+            # --- SCALE ---
+            dpg.add_text("Scale")
+            # speed=0.005 for fine control
+            dpg.add_drag_float(
+                label="Factor", 
+                default_value=self.scale, 
+                speed=0.005,
+                min_value=0.1, 
+                max_value=3.0, 
+                callback=self.callback_update_params, 
+                tag="_slider_scale"
+            )
+            dpg.add_separator()
+            
+            # --- ROTATION ---
+            dpg.add_text("Rotation (Euler XYZ)")
+            # Using drag_float instead of slider for better sensitivity (speed=0.1 degrees)
+            dpg.add_drag_float(label="Pitch (X)", default_value=self.rot_euler[0], speed=0.1, callback=self.callback_update_params, tag="_slider_rot_x")
+            dpg.add_drag_float(label="Yaw (Y)",   default_value=self.rot_euler[1], speed=0.1, callback=self.callback_update_params, tag="_slider_rot_y")
+            dpg.add_drag_float(label="Roll (Z)",  default_value=self.rot_euler[2], speed=0.1, callback=self.callback_update_params, tag="_slider_rot_z")
+            dpg.add_separator()
+            
+            # --- TRANSLATION ---
+            dpg.add_text("Translation (Meters)")
+            # Adaptive range based on initial translation + margin
+            t_margin = 0.2 # Reduced default margin for finer control visually
+            tx, ty, tz = self.translation
+            # Use drag_float for infinite range and better sensitivity control
+            # speed=0.001 means 1mm per pixel drag
+            dpg.add_drag_float(label="X", default_value=tx, speed=0.0005, callback=self.callback_update_params, tag="_slider_trans_x")
+            dpg.add_drag_float(label="Y", default_value=ty, speed=0.0005, callback=self.callback_update_params, tag="_slider_trans_y")
+            dpg.add_drag_float(label="Z", default_value=tz, speed=0.0005, callback=self.callback_update_params, tag="_slider_trans_z")
+            dpg.add_separator()
+            
+            def callback_save(sender, app_data):
+                dpg.stop_dearpygui()
+                
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="UNDO (Ctrl+Z)", callback=self.callback_undo, width=105, height=30)
+                dpg.add_button(label="RESET", callback=self.callback_reset, width=105, height=30)
+                dpg.add_button(label="SAVE", callback=callback_save, width=105, height=30)
+
+        # Register keyboard handlers
+        with dpg.handler_registry():
+            dpg.add_key_press_handler(dpg.mvKey_Z, callback=self.callback_key_press)
+            dpg.add_key_press_handler(dpg.mvKey_Left, callback=self.callback_key_press)
+            dpg.add_key_press_handler(dpg.mvKey_Right, callback=self.callback_key_press)
+            dpg.add_key_press_handler(dpg.mvKey_Up, callback=self.callback_key_press)
+            dpg.add_key_press_handler(dpg.mvKey_Down, callback=self.callback_key_press)
+            # Shift modifiers are checked inside callback
+
+        # Register mouse wheel handler for UI controls
+        with dpg.handler_registry():
+            dpg.add_mouse_wheel_handler(callback=self.callback_mouse_wheel_ui)
+
+    def callback_mouse_wheel_ui(self, sender, app_data):
+        delta = app_data # typically 1.0 or -1.0
+        
+        # Map tags to (attribute_name, index, step)
+        controls = {
+            "_slider_scale":   ('scale', None, 0.005),
+            "_slider_rot_x":   ('rot_euler', 0, 0.1),
+            "_slider_rot_y":   ('rot_euler', 1, 0.1),
+            "_slider_rot_z":   ('rot_euler', 2, 0.1),
+            "_slider_trans_x": ('translation', 0, 0.0005),
+            "_slider_trans_y": ('translation', 1, 0.0005),
+            "_slider_trans_z": ('translation', 2, 0.0005),
+        }
+
+        for tag, (attr, idx, step) in controls.items():
+            if dpg.is_item_hovered(tag):
+                # Apply change
+                change = step * delta
+                
+                # Push history only on first significant change? 
+                # For wheel, distinct steps are clear, so let's try to be smart or just update.
+                # Ideally, we should push history.
+                # But wheel can fire rapidly. Let's just update for now to keep it smooth.
+                
+                if attr == 'scale':
+                    self.scale += change
+                    self.scale = max(0.1, min(3.0, self.scale))
+                    dpg.set_value(tag, self.scale)
+                elif attr == 'rot_euler':
+                    self.rot_euler[idx] += change
+                    dpg.set_value(tag, self.rot_euler[idx])
+                elif attr == 'translation':
+                    self.translation[idx] += change
+                    dpg.set_value(tag, self.translation[idx])
+                
+                self.update_transform_logical()
+                self.need_update = True
+                return # Handled, stop checking
+
+    def callback_key_press(self, sender, app_data):
+        # Handle Ctrl+Z for Undo
+        if dpg.is_key_down(dpg.mvKey_Control) and app_data == dpg.mvKey_Z:
+            self.callback_undo(None, None)
+            return
+
+        # Handle Arrow Keys for Fine Translation
+        # Step size: 0.5mm (0.0005m) normally, 5mm (0.005m) with Shift
+        step = 0.005 if dpg.is_key_down(dpg.mvKey_Shift) else 0.0005
+        
+        changed = False
+        if app_data == dpg.mvKey_Left:
+            self.push_history() # Save state before move
+            self.translation[0] -= step # X-
+            changed = True
+        elif app_data == dpg.mvKey_Right:
+            self.push_history()
+            self.translation[0] += step # X+
+            changed = True
+        elif app_data == dpg.mvKey_Up:
+            self.push_history()
+            self.translation[1] += step # Y+
+            changed = True
+        elif app_data == dpg.mvKey_Down:
+            self.push_history()
+            self.translation[1] -= step # Y-
+            changed = True
+            
+        if changed:
+            # Update GUI sliders to match internal state
+            dpg.set_value("_slider_trans_x", self.translation[0])
+            dpg.set_value("_slider_trans_y", self.translation[1])
+            self.update_transform_logical()
+            self.need_update = True
+
+    def push_history(self):
+        """Save current state to history stack."""
+        state = {
+            'scale': self.scale,
+            'rot': list(self.rot_euler),
+            'trans': list(self.translation)
+        }
+        self.history.append(state)
+        # Limit history size
+        if len(self.history) > 20: 
+            self.history.pop(0)
+
+    def callback_undo(self, sender, app_data):
+        if not self.history:
+            print("  [UI] Nothing to undo.")
+            return
+            
+        prev_state = self.history.pop()
+        self.scale = prev_state['scale']
+        self.rot_euler = list(prev_state['rot'])
+        self.translation = list(prev_state['trans'])
+        
+        # Sync GUI
+        dpg.set_value("_slider_scale", self.scale)
+        dpg.set_value("_slider_rot_x", self.rot_euler[0])
+        dpg.set_value("_slider_rot_y", self.rot_euler[1])
+        dpg.set_value("_slider_rot_z", self.rot_euler[2])
+        dpg.set_value("_slider_trans_x", self.translation[0])
+        dpg.set_value("_slider_trans_y", self.translation[1])
+        dpg.set_value("_slider_trans_z", self.translation[2])
+        
+        self.update_transform_logical()
+        self.need_update = True
+        print("  [UI] Undo performed.")
+
+    def callback_reset(self, sender, app_data):
+        self.push_history() # Save current before reset
+        
+        self.scale = self.initial_state['scale']
+        self.rot_euler = list(self.initial_state['rot'])
+        self.translation = list(self.initial_state['trans'])
+        
+        dpg.set_value("_slider_scale", self.scale)
+        dpg.set_value("_slider_rot_x", self.rot_euler[0])
+        dpg.set_value("_slider_rot_y", self.rot_euler[1])
+        dpg.set_value("_slider_rot_z", self.rot_euler[2])
+        dpg.set_value("_slider_trans_x", self.translation[0])
+        dpg.set_value("_slider_trans_y", self.translation[1])
+        dpg.set_value("_slider_trans_z", self.translation[2])
+        
+        self.update_transform_logical()
+        self.need_update = True
+        print("  [UI] Reset to initial state.")
+
+    def callback_update_params_with_history(self, sender, app_data):
+        # We only push history on 'activation' (start of drag) or check if value changed signficantly?
+        # DPG callbacks fire continuously during drag.
+        # Ideally we want history on "mouse release" or "start edit".
+        # But for simplicity, we might not push history *during* drag via this callback 
+        # unless we can detect 'start'. 
+        # A simple hack: push history if the value is 'stable' or just rely on manual 'Snapshot' button?
+        # Better: let's not spam history on drag. 
+        # We will add a helper 'callback_start_edit' if possible, but DPG is limited.
+        # Alternative: The user explicitly uses undo for 'steps'. 
+        # If we spam history, undo becomes tedious (undoing 0.001 changes).
+        # Let's try to only push when the *sender* changes (focus logic).
+        # OR: Just simple "Push History" button? No, that's bad UX.
+        # Let's implement a 'lazy' history: save state ONLY when starting interaction? 
+        # Hard with standard callbacks.
+        # Compromise: We won't auto-push on drag. We push on Key press and Button clicks.
+        # For sliders, we can't easily undo 'half a drag'. 
+        # We will add checks: if time since last history push > 1 sec? No.
+        # Let's just update values here.
+        self.callback_update_params(sender, app_data)
+
+    def callback_update_params(self, sender, app_data):
+        self.scale = dpg.get_value("_slider_scale")
+        self.rot_euler[0] = dpg.get_value("_slider_rot_x")
+        self.rot_euler[1] = dpg.get_value("_slider_rot_y")
+        self.rot_euler[2] = dpg.get_value("_slider_rot_z")
+        self.translation[0] = dpg.get_value("_slider_trans_x")
+        self.translation[1] = dpg.get_value("_slider_trans_y")
+        self.translation[2] = dpg.get_value("_slider_trans_z")
+        
+        self.update_transform_logical()
+        self.need_update = True
+
+    def prepare_camera(self):
+        """Adapter to convert OrbitCamera to what Gaussian Splatting / NVDiffRenderer expects."""
+        @dataclass
+        class Cam:
+            FoVx = float(np.radians(self.cam.fovx))
+            FoVy = float(np.radians(self.cam.fovy))
+            image_height = self.cam.image_height
+            image_width = self.cam.image_width
+            world_view_transform = torch.tensor(self.cam.world_view_transform).float().cuda().T
+            full_proj_transform = torch.tensor(self.cam.full_proj_transform).float().cuda().T
+            camera_center = torch.tensor(self.cam.pose[:3, 3]).cuda()
+        return Cam
+
+    def run(self):
+        """Main Render Loop"""
+        print("  Starting GUI render loop...")
+        while dpg.is_dearpygui_running():
+            
+            if self.need_update:
+                cam = self.prepare_camera()
+                
+                # Render FLAME (Static Reference)
+                out_flame = self.mesh_renderer.render_from_camera(
+                    self.flame_verts, 
+                    self.flame_faces, 
+                    cam, 
+                    face_colors=self.flame_face_colors
+                )
+                rgba_flame = out_flame['rgba'].squeeze(0) # [H, W, 4]
+                
+                # Render User Mesh (Dynamic)
+                out_user = self.mesh_renderer.render_from_camera(
+                    self.user_verts_transformed,
+                    self.user_faces,
+                    cam,
+                    face_colors=self.user_face_colors
+                )
+                rgba_user = out_user['rgba'].squeeze(0) # [H, W, 4]
+                
+                # Composite
+                # Simple alpha compositing: User over FLAME over White Background
+                bg_color = torch.tensor([1.0, 1.0, 1.0, 1.0]).cuda().view(1, 1, 4)
+                
+                # Mix User over FLAME
+                # out = user * user_a + flame * flame_a * (1 - user_a)
+                # But we have pre-multiplied alpha or not? setup in render_from_camera seems to return [RGB, A]
+                
+                # Let's do simple manual composition
+                # 1. Background
+                # USE cam snapshot dimensions to ensure match with renderer output
+                canvas = bg_color.expand(cam.image_height, cam.image_width, 4).clone()
+                
+                if canvas.shape[0] != rgba_flame.shape[0] or canvas.shape[1] != rgba_flame.shape[1]:
+                    print(f"Warning: Resize detected. Canvas: {canvas.shape}, Flame: {rgba_flame.shape}")
+                    # Skip frame if mismatch (though using cam.* should prevent this)
+                    canvas = bg_color.expand(rgba_flame.shape[0], rgba_flame.shape[1], 4).clone()
+
+                # 2. Add FLAME
+                flame_alpha = rgba_flame[..., 3:] * self.flame_color[3]
+                canvas = rgba_flame * flame_alpha + canvas * (1 - flame_alpha)
+                
+                # 3. Add User
+                user_alpha = rgba_user[..., 3:] * self.user_color[3]
+                canvas = rgba_user * user_alpha + canvas * (1 - user_alpha)
+                
+                # Convert to numpy for display
+                # DPG requires contiguous float32 buffer
+                buffer = canvas[..., :3].cpu().numpy()
+                self.render_buffer = np.ascontiguousarray(buffer, dtype=np.float32)
+                
+                # Safety check for dimensions before passing to DPG
+                # DPG texture was created with (self.W, self.H)
+                # Our buffer is (H, W, 3). Total elements must match.
+                expected_size = self.W * self.H * 3
+                if self.render_buffer.size != expected_size:
+                    print(f"Warning: Buffer size mismatch. W={self.W} H={self.H}, Buffer={self.render_buffer.shape}")
+                    # Skip update to avoid crash
+                else: 
+                    # Update DPG texture
+                    dpg.set_value("_texture", self.render_buffer)
+                    
+                self.need_update = False
+            
+            dpg.render_dearpygui_frame()
+
+    def get_final_transform(self):
+        """Return the final transformation matrix and components."""
+        return self.current_transform, {
+            'scale': self.scale,
+            'rotation_matrix': self.current_R,
+            'translation': np.array(self.translation)
+        }
+
+
 def main(cfg: AlignmentConfig) -> None:
     """
     Main execution function with comprehensive output generation.
@@ -1553,15 +1990,16 @@ def main(cfg: AlignmentConfig) -> None:
     elif cfg.landmark_type == "full" and expected_count == 70:
         # ========== TARGET: Full mode (70 points) ==========
         if actual_count == 68:
-            # 68 → 70: Cannot convert (no eye region details)
-            raise ValueError(
-                f"❌ Cannot convert 68-point to 70-point format\n"
-                f"  Reason: 68-point format lacks eye region details\n"
-                f"  68-point = face contour + facial features (no eyeballs)\n"
-                f"  70-point = 53 static + 17 eye region details\n"
-                f"  File: {cfg.lmk_path}\n"
-                f"  💡 Suggestion: Use --landmark-type static to align with 51 facial points"
-            )
+            # 68 → 68 subset of 70: Use corresponding subset from FLAME landmarks
+            # 68-point = [0:17] face contour + [17:68] facial features
+            # 70-point = [0:17] face contour + [17:70] facial features (51) + eye region (17)
+            # Strategy: Extract FLAME landmarks [0:17] + [17:70] to match 68 input points
+            print(f"  🔄 Using 68-point format with 70-point FLAME subset")
+            print(f"  📌 68-point = [0:17] contour + [17:68] features")
+            print(f"  📌 FLAME subset = [0:17] contour + [17:70] features+eyes")
+            print(f"  ⚠️  Note: Using 68 of 70 FLAME landmarks for alignment")
+            # No conversion needed for user_landmarks, but we'll trim FLAME landmarks later
+            # Mark this case for partial landmark handling below
             
         elif actual_count == 51:
             # 51 → 70: Cannot convert (no eyeballs)
@@ -1668,8 +2106,97 @@ def main(cfg: AlignmentConfig) -> None:
         execution_time=0.0,  # Will be updated
         timing_breakdown=timing
     )
+
+    # [RESUME FROM EXISTING ALIGNMENT]
+    if cfg.load_alignment_path is not None:
+        if cfg.load_alignment_path.exists():
+            print(f"\nLoading existing alignment from: {cfg.load_alignment_path}")
+            try:
+                data = np.load(cfg.load_alignment_path)
+                
+                # Check required keys
+                required = ['scale', 'rotation', 'translation', 'transform_matrix']
+                if all(k in data for k in required):
+                    # Override result metrics
+                    result.scale_factor = float(data['scale'])
+                    result.rotation_matrix = data['rotation']
+                    result.translation_vector = data['translation']
+                    result.transform_matrix = data['transform_matrix']
+                    
+                    # Apply transform to mesh and landmarks
+                    result.user_mesh_aligned_vertices = trimesh.transformations.transform_points(
+                        result.user_mesh_vertices, result.transform_matrix
+                    )
+                    result.user_landmarks_aligned = trimesh.transformations.transform_points(
+                        result.user_landmarks_original, result.transform_matrix
+                    )
+                    
+                    # Re-calc errors
+                    per_lmk_errors = np.sqrt(((result.user_landmarks_aligned - result.flame_landmarks) ** 2).sum(axis=1))
+                    result.per_landmark_errors = per_lmk_errors
+                    result.mean_lmk_error = per_lmk_errors.mean()
+                    result.max_lmk_error = per_lmk_errors.max()
+                    result.std_lmk_error = per_lmk_errors.std()
+                    
+                    print(f"  ✓ Loaded successfully. Mean Error: {result.mean_lmk_error:.6f}")
+                else:
+                    print(f"  ❌ Invalid .npz file. Missing keys: {[k for k in required if k not in data]}")
+                    print("  Proceeding with auto-alignment result instead.")
+            except Exception as e:
+                print(f"  ❌ Failed to load alignment: {e}")
+        else:
+            print(f"  ❌ File not found: {cfg.load_alignment_path}")
     
+    # [MANUAL FINE-TUNING STEP]
+    if cfg.manual_fine_tune:
+        print("\n" + "="*80)
+        print("MANUAL FINE-TUNING ENABLED")
+        print("="*80)
+        print("  Launching interactive GUI for fine-tuning...")
+        print("  Close the GUI window to save changes and continue.")
+        
+        try:
+            viewer = FineTuningViewer(cfg, result)
+            viewer.run() # Blocking call
+            
+            # Retrieve updated transformation
+            new_transform, new_components = viewer.get_final_transform()
+            
+            print("\n  ✓ Fine-tuning complete. Updating results...")
+            
+            # Update Result Object
+            result.transform_matrix = new_transform
+            result.scale_factor = new_components['scale']
+            result.rotation_matrix = new_components['rotation_matrix']
+            result.translation_vector = new_components['translation']
+            
+            # Re-apply transformation to vertices (Critical for correct output)
+            result.user_mesh_aligned_vertices = trimesh.transformations.transform_points(
+                result.user_mesh_vertices, new_transform
+            )
+            result.user_landmarks_aligned = trimesh.transformations.transform_points(
+                result.user_landmarks_original, new_transform
+            )
+            
+            # Re-compute errors
+            per_lmk_errors = np.sqrt(((result.user_landmarks_aligned - result.flame_landmarks) ** 2).sum(axis=1))
+            result.per_landmark_errors = per_lmk_errors
+            result.mean_lmk_error = per_lmk_errors.mean()
+            result.max_lmk_error = per_lmk_errors.max()
+            result.std_lmk_error = per_lmk_errors.std()
+            
+            print(f"  New Mean Error: {result.mean_lmk_error:.6f} (may vary from auto-alignment)")
+            
+        except ImportError as e:
+            print(f"  ❌ Failed to launch fine-tuning GUI: {e}")
+            print("  Make sure 'dearpygui' is installed and you are running in a GUI environment.")
+        except Exception as e:
+            print(f"  ❌ Error during fine-tuning: {e}")
+            import traceback
+            traceback.print_exc()
+
     # Step 6: Save comprehensive outputs
+
     t0 = time()
     save_comprehensive_outputs(cfg, result)
     timing['Output generation'] = time() - t0
@@ -1686,22 +2213,17 @@ def main(cfg: AlignmentConfig) -> None:
     result.timing_breakdown = timing
     
     # Re-generate report with complete timing
-    _save_alignment_report(cfg.output_dir / "logs", cfg, result)
+    _save_alignment_report(cfg.output_dir, cfg, result)
     
     # Final summary
-    print("\n" + "="*80)
+    print("\n" + "="*60)
     print("✓ Alignment Complete!")
-    print("="*80)
-    print(f"\nExecution Summary:")
-    print(f"  Total time: {total_time:.3f} seconds")
-    print(f"  Mean landmark error: {result.mean_lmk_error:.6f}")
-    print(f"  Output directory: {cfg.output_dir.absolute()}")
-    print(f"\nNext Steps:")
-    print(f"  1. Review alignment report: {cfg.output_dir}/logs/alignment_report.txt")
-    print(f"  2. Check visualizations: {cfg.output_dir}/visualizations/")
-    print(f"  3. Use aligned mesh for tracking:")
-    print(f"     --mesh-path {cfg.output_dir}/meshes/user_mesh_aligned.obj")
-    print("="*80)
+    print("="*60)
+    print(f"  Results saved to: {cfg.output_dir.absolute()}")
+    print(f"  Report:           {cfg.output_dir}/alignment_report.txt")
+    print(f"  Visualizations:   {cfg.output_dir}/visualizations/")
+    print(f"  Aligned Mesh:     {cfg.output_dir}/meshes/user_mesh_aligned.obj")
+    print("="*60)
 
 
 if __name__ == "__main__":

@@ -35,7 +35,16 @@ except ImportError:
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    if dataset.bind_to_mesh:
+    if dataset.mesh_path:
+        # Custom mesh mode (replaces FLAME)
+        from scene import MeshGaussianModel
+        gaussians = MeshGaussianModel(
+            dataset.mesh_path, 
+            dataset.sh_degree, 
+            not_optimize_mesh_transform=not dataset.optimize_mesh_transform
+        )
+        mesh_renderer = NVDiffRenderer()
+    elif dataset.bind_to_mesh:
         gaussians = FlameGaussianModel(dataset.sh_degree, dataset.disable_flame_static_offset, dataset.not_finetune_flame_params)
         mesh_renderer = NVDiffRenderer()
     else:

@@ -625,8 +625,6 @@ class LocalViewer(Mini3DViewer):
             camera_indx = i
             timestep_indices.append(timestep_index)
             camera_indices.append(camera_indx)
-            
-            tid2paths[timestep_index]['file_path']
 
             frame = {
                 "cx": cx,
@@ -1089,14 +1087,14 @@ class LocalViewer(Mini3DViewer):
                     dpg.add_text("Rotation (degrees):")
                     dpg.add_slider_float(
                         label="Pitch (Open/Close)",
-                        min_value=-30, max_value=30,  # Centered at 0
+                        min_value=-5, max_value=5,  # Centered at 0
                         default_value=0, format="%.1f",
                         callback=callback_lbs_transform,
                         tag="_slider_lbs_rot_pitch", width=200
                     )
                     dpg.add_slider_float(
                         label="Yaw (Side-to-Side)",
-                        min_value=-5, max_value=5,
+                        min_value=-3, max_value=10,
                         default_value=0, format="%.1f",
                         callback=callback_lbs_transform,
                         tag="_slider_lbs_rot_yaw", width=200
