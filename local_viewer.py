@@ -25,6 +25,7 @@ from utils.viewer_utils import Mini3DViewer, Mini3DViewerConfig
 from gaussian_renderer import GaussianModel, FlameGaussianModel
 from gaussian_renderer import render
 from mesh_renderer import NVDiffRenderer
+from scene import MeshGaussianModel
 
 
 @dataclass
@@ -44,6 +45,8 @@ class Config(Mini3DViewerConfig):
     """Path to the gaussian splatting file"""
     motion_path: Optional[Path] = None
     """Path to the motion file (npz)"""
+    mesh_path: Optional[Path] = None
+    """Path to custom mesh file (.obj) for MeshGaussianModel mode"""
     sh_degree: int = 3
     """Spherical Harmonics degree"""
     background_color: tuple[float, float, float] = (1., 1., 1.)
@@ -62,8 +65,8 @@ class Config(Mini3DViewerConfig):
     """The UI will be simplified in demo mode."""
     
     # === LBS功能参数 ===
-    lbs: bool = False
-    """Enable Linear Blend Skinning control"""
+    lbs: Literal["off", "auto", "joint"] = "off"
+    """LBS mode: 'off' (disabled), 'auto' (proximity-based), 'joint' (from .pp files)"""
     segment_path: Optional[Path] = None
     """Directory containing segment mesh files (obj/stl)"""
     transform_path: Optional[Path] = None
@@ -91,6 +94,9 @@ class LocalViewer(Mini3DViewer):
 
         print("Initializing 3D Gaussians...")
         self.init_gaussians()
+        
+        # Initialize flame_param to None (will be set for FlameGaussianModel only)
+        self.flame_param = None
 
         if self.gaussians.binding is not None:
             # rendering settings
@@ -99,8 +105,8 @@ class LocalViewer(Mini3DViewer):
             print("Initializing mesh renderer...")
             self.mesh_renderer = NVDiffRenderer(use_opengl=False)
         
-        # FLAME parameters
-        if self.gaussians.binding is not None:
+        # FLAME-specific parameters (only for FlameGaussianModel, not MeshGaussianModel)
+        if isinstance(self.gaussians, FlameGaussianModel):
             print("Initializing FLAME parameters...")
             self.reset_flame_param()
             
@@ -108,6 +114,11 @@ class LocalViewer(Mini3DViewer):
             print("Initializing FLAME mesh for timestep 0...")
             self.gaussians.select_mesh_by_timestep(0)
             print(f"FLAME mesh initialized: verts shape = {self.gaussians.verts.shape if hasattr(self.gaussians, 'verts') else 'N/A'}")
+        elif isinstance(self.gaussians, MeshGaussianModel):
+            # For MeshGaussianModel, just initialize mesh for visualization
+            print("Initializing custom mesh for timestep 0...")
+            self.gaussians.select_mesh_by_timestep(0)
+            print(f"Custom mesh initialized: verts shape = {self.gaussians.verts.shape if hasattr(self.gaussians, 'verts') else 'N/A'}")
         
         # === Segment Mesh功能 (Level 2) ===
         self.segment_meshes = {}  # {id: {'vertices': np.array, 'faces': np.array}}
@@ -120,8 +131,11 @@ class LocalViewer(Mini3DViewer):
         # === LBS功能 (Level 3) ===
         self.lbs_controller = None
         self.show_lbs_weights = False  # whether to show weight visualization
+        self.show_joint_points = False  # whether to show joint seed points
+        self.face_colors_weights_cache = None  # cache for weight visualization (vectorized)
+        self.joint_seed_coords = None  # cached seed coordinates for point rendering
         
-        if cfg.lbs:
+        if cfg.lbs != "off":
             if cfg.segment_path is None:
                 print("[LBS] Error: --lbs requires --segment-path to be specified")
             elif len(self.segment_meshes) == 0:
@@ -135,6 +149,27 @@ class LocalViewer(Mini3DViewer):
                 self._init_lbs_controller()
         
         super().__init__(cfg, 'GaussianAvatars - Local Viewer')
+    
+    def _get_gaussians_translation(self, timestep=0):
+        """
+        Helper method to get translation from gaussians model.
+        Supports both FlameGaussianModel (flame_param) and MeshGaussianModel (mesh_param).
+        
+        Args:
+            timestep: Timestep index (only used for FlameGaussianModel)
+            
+        Returns:
+            translation: [3] numpy array, or None if no translation available
+        """
+        if hasattr(self.gaussians, 'flame_param') and self.gaussians.flame_param is not None:
+            # FlameGaussianModel: use flame_param['translation'][timestep]
+            return self.gaussians.flame_param['translation'][timestep].cpu().numpy()
+        elif hasattr(self.gaussians, 'mesh_param') and self.gaussians.mesh_param is not None:
+            # MeshGaussianModel: use mesh_param['translation'][0] (single timestep)
+            return self.gaussians.mesh_param['translation'][0].cpu().numpy()
+        else:
+            # No translation available
+            return None
 
         if self.gaussians.binding is not None:
             self.num_timesteps = self.gaussians.num_timesteps
@@ -143,10 +178,26 @@ class LocalViewer(Mini3DViewer):
             self.gaussians.select_mesh_by_timestep(self.timestep)
 
     def init_gaussians(self):
-        # load gaussians
-        if (Path(self.cfg.point_path).parent / "flame_param.npz").exists():
+        # Determine which Gaussian model to use based on available files
+        # Priority: mesh_path > flame_param.npz > vanilla GaussianModel
+        
+        if self.cfg.mesh_path is not None:
+            # Custom mesh mode (MeshGaussianModel)
+            if not Path(self.cfg.mesh_path).exists():
+                raise FileNotFoundError(f'Mesh file not found: {self.cfg.mesh_path}')
+            print(f"[LocalViewer] Using MeshGaussianModel with mesh: {self.cfg.mesh_path}")
+            self.gaussians = MeshGaussianModel(
+                mesh_path=str(self.cfg.mesh_path),
+                sh_degree=self.cfg.sh_degree,
+                not_optimize_mesh_transform=True  # Viewer doesn't optimize
+            )
+        elif self.cfg.point_path is not None and (Path(self.cfg.point_path).parent / "flame_param.npz").exists():
+            # FLAME mode
+            print("[LocalViewer] Using FlameGaussianModel (flame_param.npz found)")
             self.gaussians = FlameGaussianModel(self.cfg.sh_degree)
         else:
+            # Vanilla mode
+            print("[LocalViewer] Using GaussianModel (no binding)")
             self.gaussians = GaussianModel(self.cfg.sh_degree)
 
         # selected_fid = self.gaussians.flame_model.mask.get_fid_by_region(['left_half'])
@@ -154,6 +205,7 @@ class LocalViewer(Mini3DViewer):
         # unselected_fid = self.gaussians.flame_model.mask.get_fid_except_fids(selected_fid)
         unselected_fid = []
         
+        # Load Gaussian points if path provided
         if self.cfg.point_path is not None:
             if self.cfg.point_path.exists():
                 self.gaussians.load_ply(self.cfg.point_path, has_target=False, motion_path=self.cfg.motion_path, disable_fid=unselected_fid)
@@ -295,12 +347,14 @@ class LocalViewer(Mini3DViewer):
         # Diagnostic output to debug alignment
         if self.cfg.debug and self.gaussians.binding is not None:
             timestep = getattr(self.gaussians, 'timestep', 0)
-            flame_trans = self.gaussians.flame_param['translation'][timestep].cpu().numpy()
-            flame_center = self.gaussians.verts[0].cpu().numpy().mean(axis=0)
+            model_trans = self._get_gaussians_translation(timestep)
+            if model_trans is None:
+                model_trans = np.zeros(3)
+            mesh_center = self.gaussians.verts[0].cpu().numpy().mean(axis=0)
             
             print(f"\n[Segment] === Coordinate Alignment Diagnostics ===")
-            print(f"[Segment] FLAME translation[{timestep}]: {flame_trans}")
-            print(f"[Segment] FLAME mesh center (global): [{flame_center[0]:.4f}, {flame_center[1]:.4f}, {flame_center[2]:.4f}]")
+            print(f"[Segment] Model translation[{timestep}]: {model_trans}")
+            print(f"[Segment] Mesh center (global): [{mesh_center[0]:.4f}, {mesh_center[1]:.4f}, {mesh_center[2]:.4f}]")
             
             for seg_id in list(self.segment_meshes.keys())[:2]:  # Only first 2 to avoid spam
                 seg_center_canonical = self.segment_meshes_canonical[seg_id].mean(axis=0)
@@ -308,9 +362,9 @@ class LocalViewer(Mini3DViewer):
                 print(f"[Segment] Segment_{seg_id} center (canonical): [{seg_center_canonical[0]:.4f}, {seg_center_canonical[1]:.4f}, {seg_center_canonical[2]:.4f}]")
                 print(f"[Segment] Segment_{seg_id} center (global):    [{seg_center_global[0]:.4f}, {seg_center_global[1]:.4f}, {seg_center_global[2]:.4f}]")
                 
-                dist_canonical_to_flame = np.linalg.norm(seg_center_canonical - flame_center)
-                dist_global_to_flame = np.linalg.norm(seg_center_global - flame_center)
-                print(f"[Segment] Segment_{seg_id} distance to FLAME: canonical={dist_canonical_to_flame:.4f}, global={dist_global_to_flame:.4f}")
+                dist_canonical_to_mesh = np.linalg.norm(seg_center_canonical - mesh_center)
+                dist_global_to_mesh = np.linalg.norm(seg_center_global - mesh_center)
+                print(f"[Segment] Segment_{seg_id} distance to mesh: canonical={dist_canonical_to_mesh:.4f}, global={dist_global_to_mesh:.4f}")
             
             print(f"[Segment] =======================================\n")
         
@@ -336,14 +390,18 @@ class LocalViewer(Mini3DViewer):
         
         
         
-        # Get FLAME's global translation for current timestep
-        if self.gaussians.binding is None or not hasattr(self.gaussians, 'flame_param'):
-            # No FLAME parameters: segments stay in canonical space
+        # Get global translation for current timestep
+        if self.gaussians.binding is None:
+            # No mesh binding: segments stay in canonical space
             return
         
         # Use gaussians.timestep if available, otherwise use 0 (single timestep mode)
         timestep = getattr(self.gaussians, 'timestep', 0)
-        flame_translation = self.gaussians.flame_param['translation'][timestep].cpu().numpy()  # [3]
+        model_translation = self._get_gaussians_translation(timestep)
+        
+        if model_translation is None:
+            # No translation available: segments stay in canonical space
+            return
         
         # Apply same translation to all segments
         for seg_id in self.segment_meshes:
@@ -353,8 +411,8 @@ class LocalViewer(Mini3DViewer):
             # Start from canonical space
             verts_canonical = self.segment_meshes_canonical[seg_id]
             
-            # Add FLAME's global translation
-            verts_global = verts_canonical + flame_translation
+            # Add model's global translation
+            verts_global = verts_canonical + model_translation
             
             # Update segment vertices to global space
             self.segment_meshes[seg_id]['verts'] = torch.from_numpy(verts_global).float().cuda().unsqueeze(0)
@@ -402,6 +460,26 @@ class LocalViewer(Mini3DViewer):
         
         
         # Initialize LBS controller with mm-scaled vertices
+        # Determine seed mode and joint files
+        seed_mode = "auto"
+        joint_files = None
+        
+        if self.cfg.lbs == "joint":
+            seed_mode = "joint"
+            segment_dir = Path(self.cfg.segment_path)
+            joint0_path = segment_dir / "joint0.pp"
+            joint1_path = segment_dir / "joint1.pp"
+            
+            if not joint0_path.exists() or not joint1_path.exists():
+                print(f"[LBS] Error: joint files not found in {segment_dir}")
+                print(f"[LBS]   Expected: joint0.pp (skull) and joint1.pp (jaw)")
+                return
+            
+            joint_files = (joint0_path, joint1_path)
+            print(f"[LBS] Using manual joint mode with files from {segment_dir}")
+        else:
+            print(f"[LBS] Using automatic proximity-based seed selection")
+        
         lbs_config = LBSConfig(
             weight_damping=self.cfg.lbs_weight_damping,
             small_step_radius=self.cfg.lbs_small_step_radius,
@@ -410,7 +488,9 @@ class LocalViewer(Mini3DViewer):
             max_seeds=300,
             laplacian_iterations=5,
             laplacian_alpha=0.5,
-            debug=self.cfg.debug  # Pass debug flag
+            debug=self.cfg.debug,
+            seed_mode=seed_mode,
+            joint_files=joint_files
         )
         
         try:
@@ -421,6 +501,17 @@ class LocalViewer(Mini3DViewer):
                 config=lbs_config
             )
             print("[LBS] LBS controller initialized successfully")
+            
+            # Store seed coordinates for joint point visualization (convert back to meters)
+            # Note: seeds are indices into skin_verts, get actual coordinates
+            skull_seed_indices = self.lbs_controller.skull_seeds
+            jaw_seed_indices = self.lbs_controller.jaw_seeds
+            self.joint_seed_coords = {
+                'skull': skin_verts[skull_seed_indices],  # Already in meters
+                'jaw': skin_verts[jaw_seed_indices]       # Already in meters
+            }
+            print(f"[LBS] Cached seed coords: skull={len(skull_seed_indices)}, jaw={len(jaw_seed_indices)}")
+            
         except Exception as e:
             print(f"[LBS] Error: Failed to initialize LBS controller: {e}")
             import traceback
@@ -429,7 +520,7 @@ class LocalViewer(Mini3DViewer):
     
     def _update_lbs_deformation(self):
         """应用LBS变形到skin和jaw meshes"""
-        if not self.cfg.lbs or self.lbs_controller is None:
+        if self.cfg.lbs == "off" or self.lbs_controller is None:
             return
         
         # 收集变换参数 (slider值已经是mm,直接使用)
@@ -465,22 +556,24 @@ class LocalViewer(Mini3DViewer):
         # Update segment meshes vertices
         skull_id, jaw_id = self.cfg.skull_jaw
         
-        # Get current FLAME translation for global alignment
-        flame_translation = self.gaussians.flame_param['translation'][self.timestep].cpu().numpy()
+        # Get current model translation for global alignment
+        model_translation = self._get_gaussians_translation(self.timestep)
+        if model_translation is None:
+            model_translation = np.zeros(3)
         
         # Skull: Update canonical position + apply global translation
         self.segment_meshes_canonical[skull_id] = skull_verts_m.copy()
-        self.segment_meshes[skull_id]['verts'] = torch.from_numpy(skull_verts_m + flame_translation).float().cuda().unsqueeze(0)
+        self.segment_meshes[skull_id]['verts'] = torch.from_numpy(skull_verts_m + model_translation).float().cuda().unsqueeze(0)
         
         # Jaw: LBS deformed + apply global translation
         self.segment_meshes_canonical[jaw_id] = jaw_verts_m.copy()
-        self.segment_meshes[jaw_id]['verts'] = torch.from_numpy(jaw_verts_m + flame_translation).float().cuda().unsqueeze(0)
+        self.segment_meshes[jaw_id]['verts'] = torch.from_numpy(jaw_verts_m + model_translation).float().cuda().unsqueeze(0)
         
         # Sync other segments (non-LBS) to maintain global alignment
         for seg_id in self.segment_meshes:
             if seg_id not in [skull_id, jaw_id]:
-                # These segments don't deform, just follow FLAME's global position
-                verts_global = self.segment_meshes_canonical[seg_id] + flame_translation
+                # These segments don't deform, just follow model's global position
+                verts_global = self.segment_meshes_canonical[seg_id] + model_translation
                 self.segment_meshes[seg_id]['verts'] = torch.from_numpy(verts_global).float().cuda().unsqueeze(0)
         
         self.need_update = True
@@ -904,7 +997,8 @@ class LocalViewer(Mini3DViewer):
         with dpg.window(label="Control Panel", tag="_control_window", autosize=True, pos=(window_x, 0), width=window_width):
             
             # window: FLAME ==================================================================================================
-            if self.gaussians.binding is not None:
+            # Only show FLAME controls when flame_param is available (FlameGaussianModel)
+            if hasattr(self, 'flame_param') and self.flame_param is not None:
                 with dpg.collapsing_header(label="FLAME parameters", default_open=False):
                     def callback_enable_control(sender, app_data):
                         if app_data:
@@ -1033,12 +1127,15 @@ class LocalViewer(Mini3DViewer):
                             )
 
             # window: LBS Control (Level 3) ==================================================================================================
-            if self.cfg.lbs and self.lbs_controller is not None:
+            if self.cfg.lbs != "off" and self.lbs_controller is not None:
                 with dpg.collapsing_header(label="LBS Control", default_open=False):
                     
                     # === 权重可视化 ===
                     def callback_show_weights(sender, app_data):
                         self.show_lbs_weights = app_data
+                        # Invalidate cache when toggling off (recompute next time)
+                        if not app_data:
+                            self.face_colors_weights_cache = None
                         self.need_update = True
                     
                     dpg.add_checkbox(
@@ -1047,6 +1144,19 @@ class LocalViewer(Mini3DViewer):
                         callback=callback_show_weights,
                         tag="_checkbox_show_lbs_weights"
                     )
+                    
+                    # === Joint点可视化 (仅joint模式) ===
+                    if self.cfg.lbs == "joint":
+                        def callback_show_joints(sender, app_data):
+                            self.show_joint_points = app_data
+                            self.need_update = True
+                        
+                        dpg.add_checkbox(
+                            label="Show Joint Points (Red=Skull, Blue=Jaw)",
+                            default_value=False,
+                            callback=callback_show_joints,
+                            tag="_checkbox_show_joint_points"
+                        )
                 
                 dpg.add_separator()
                 
@@ -1174,26 +1284,27 @@ class LocalViewer(Mini3DViewer):
 
                 if self.gaussians.binding is not None and dpg.get_value("_checkbox_show_mesh"):
                     # Handle weight visualization for FLAME mesh
-                    if self.cfg.lbs and self.show_lbs_weights and self.lbs_controller is not None:
-                        # Show LBS weights as heat map
-                        weights_jaw = self.lbs_controller.weights[:, 0]  # Jaw weights [N_verts]
+                    if self.cfg.lbs != "off" and self.show_lbs_weights and self.lbs_controller is not None:
+                        # Use cached face colors if available (vectorized computation)
+                        if self.face_colors_weights_cache is None:
+                            weights_jaw = self.lbs_controller.weights[:, 0]  # Jaw weights [N_verts]
+                            
+                            # Vectorized colormap application
+                            cmap = matplotlib.colormaps["jet"]
+                            weights_colors = torch.from_numpy(cmap(weights_jaw)[:, :3]).float().cuda()
+                            
+                            # VECTORIZED face color computation (replaces slow Python loop)
+                            faces = self.gaussians.faces  # [F, 3]
+                            v0_colors = weights_colors[faces[:, 0]]  # [F, 3]
+                            v1_colors = weights_colors[faces[:, 1]]  # [F, 3]
+                            v2_colors = weights_colors[faces[:, 2]]  # [F, 3]
+                            self.face_colors_weights_cache = ((v0_colors + v1_colors + v2_colors) / 3.0).unsqueeze(0)
+                            print("[LBS] Weight visualization cache computed (vectorized)")
                         
-                        # Use colormap for visualization  
-                        cmap = matplotlib.colormaps["jet"]
-                        weights_colors_np = cmap(weights_jaw)[:, :3]  # [N_verts, 3]
-                        weights_colors = torch.from_numpy(weights_colors_np).float().cuda()
-                        
-                        # CRITICAL: Face colors must be [1, N_faces, 3] for renderer
-                        # Map vertex colors to face colors by averaging vertex colors of each face
-                        n_faces = self.gaussians.faces.shape[0]
-                        face_colors_weights = torch.zeros(1, n_faces, 3, device='cuda')
-                        
-                        for i in range(n_faces):
-                            v0, v1, v2 = self.gaussians.faces[i]
-                            # Average the colors of the three vertices
-                            face_colors_weights[0, i] = (weights_colors[v0] + weights_colors[v1] + weights_colors[v2]) / 3.0
-                        
-                        out_dict = self.mesh_renderer.render_from_camera(self.gaussians.verts, self.gaussians.faces, cam, face_colors=face_colors_weights)
+                        out_dict = self.mesh_renderer.render_from_camera(
+                            self.gaussians.verts, self.gaussians.faces, cam, 
+                            face_colors=self.face_colors_weights_cache
+                        )
                     else:
                         # Normal FLAME mesh rendering
                         out_dict = self.mesh_renderer.render_from_camera(self.gaussians.verts, self.gaussians.faces, cam, face_colors=self.face_colors)
@@ -1261,6 +1372,54 @@ class LocalViewer(Mini3DViewer):
                 # Composite segment meshes on top
                 if rgb_segments is not None and alpha_segments is not None:
                     rgb = rgb * (1 - alpha_segments) + rgb_segments
+                
+                # Render joint points as colored circles (joint mode only)
+                if self.show_joint_points and self.cfg.lbs == "joint" and self.joint_seed_coords is not None:
+                    # Project 3D seed coordinates to 2D screen space
+                    model_translation = self._get_gaussians_translation(self.timestep)
+                    if model_translation is None:
+                        model_translation = np.zeros(3)
+                    
+                    # Get camera matrices
+                    view_matrix = torch.tensor(self.cam.world_view_transform).float().cuda()
+                    proj_matrix = torch.tensor(self.cam.full_proj_transform).float().cuda()
+                    
+                    point_radius = 3  # pixels
+                    
+                    for bone_type, coords in self.joint_seed_coords.items():
+                        # Apply model translation to get global coordinates
+                        global_coords = coords + model_translation
+                        
+                        # Set color: skull=red, jaw=blue
+                        color = torch.tensor([1.0, 0.0, 0.0]).cuda() if bone_type == 'skull' else torch.tensor([0.0, 0.0, 1.0]).cuda()
+                        
+                        # Project to screen space
+                        points_h = torch.from_numpy(
+                            np.concatenate([global_coords, np.ones((len(global_coords), 1))], axis=1)
+                        ).float().cuda()  # [N, 4]
+                        
+                        # View transform
+                        points_view = (view_matrix @ points_h.T).T  # [N, 4]
+                        # Projection
+                        points_clip = (proj_matrix @ points_view.T).T  # [N, 4]
+                        
+                        # Perspective divide and convert to screen coords
+                        points_ndc = points_clip[:, :2] / (points_clip[:, 3:4] + 1e-8)
+                        points_screen_x = ((points_ndc[:, 0] + 1) * 0.5 * self.W).long()
+                        points_screen_y = ((1 - points_ndc[:, 1]) * 0.5 * self.H).long()  # Flip Y
+                        
+                        # Draw circles at each point
+                        for i in range(len(points_screen_x)):
+                            px, py = points_screen_x[i].item(), points_screen_y[i].item()
+                            # Check bounds
+                            if 0 <= px < self.W and 0 <= py < self.H:
+                                # Draw filled circle (simple box approximation for speed)
+                                for dy in range(-point_radius, point_radius + 1):
+                                    for dx in range(-point_radius, point_radius + 1):
+                                        if dx*dx + dy*dy <= point_radius*point_radius:
+                                            nx, ny = px + dx, py + dy
+                                            if 0 <= nx < self.W and 0 <= ny < self.H:
+                                                rgb[ny, nx] = color
 
                 self.render_buffer = rgb.cpu().numpy()
                 if self.render_buffer.shape[0] != self.H or self.render_buffer.shape[1] != self.W:

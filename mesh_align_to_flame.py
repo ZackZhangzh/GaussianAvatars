@@ -55,17 +55,41 @@ LANDMARK_FORMAT_70_TO_53_INDICES = np.arange(17, 70, dtype=int)  # Extract stati
 
 @dataclass
 class AlignmentConfig:
-    """Configuration for mesh alignment tool."""
+    """Configuration for mesh alignment tool.
     
-    mesh_path: Path
-    """Path to the input mesh (.obj file)"""
+    Aligns source mesh to target using rigid/similarity transformation based on landmarks.
+    Supports two target modes:
+    - 'flame': Align to FLAME reference (dataset or .obj)
+    - 'custom': Align to custom mesh with landmarks
+    """
     
-    lmk_path: Path
-    """Path to landmarks (.npy or .pp file)"""
+    # ========== SOURCE (mesh to be aligned) ==========
+    source_mesh: Path
+    """Path to source mesh (.obj file) to be aligned"""
     
+    source_lmk: Path
+    """Path to source landmarks (.npy or .pp file)"""
+    
+    # ========== TARGET (reference to align to) ==========
+    target_mode: str = "flame"
+    """Target mode: 'flame' (FLAME reference) or 'custom' (custom mesh)"""
+    
+    # FLAME target mode parameters
+    target_flame_ref: Optional[Path] = None
+    """[FLAME mode] Path to FLAME reference: dataset folder (with transforms_train.json) OR .obj file"""
+    
+    # Custom target mode parameters
+    target_mesh: Optional[Path] = None
+    """[Custom mode] Path to target mesh (.obj file)"""
+    
+    target_lmk: Optional[Path] = None
+    """[Custom mode] Path to target landmarks (.npy or .pp file)"""
+    
+    # ========== OUTPUT ==========
     output_dir: Path = Path("./output/alignment")
     """Output directory for visualizations and aligned mesh"""
     
+    # ========== FLAME MODEL CONFIG (for flame mode) ==========
     landmark_type: str = "full"
     """Landmark type: 'static' (53 points) or 'full' (70 points with eyes)"""
     
@@ -78,19 +102,14 @@ class AlignmentConfig:
     add_teeth: bool = True
     """Whether FLAME model includes teeth"""
     
-    flame_reference: Optional[Path] = None
-    """Path to FLAME reference: dataset folder (with transforms_train.json) OR .obj file. If provided, uses this as FLAME mesh instead of v_template."""
-    
-    dataset_path: Optional[Path] = None
-    """DEPRECATED: Use flame_reference instead. Path to GaussianAvatars dataset directory."""
-    
-    # Scaling control options
+    # ========== TRANSFORMATION OPTIONS ==========
     enable_scaling: bool = True
     """Whether to compute and apply scaling (similarity transform). If False, uses rigid transform (rotation + translation only)."""
     
     manual_scale: Optional[float] = None
     """Manual scale factor override. If provided, uses this instead of auto-computed scale. Requires enable_scaling=True."""
     
+    # ========== VISUALIZATION OPTIONS ==========
     lmk_sphere_radius: float = 0.005
     """Radius of landmark spheres in visualization"""
     
@@ -105,6 +124,76 @@ class AlignmentConfig:
 
     load_alignment_path: Optional[Path] = None
     """Optional path to an existing alignment_transform.npz to resume fine-tuning from"""
+    
+    # ========== DEPRECATED (backward compatibility) ==========
+    mesh_path: Optional[Path] = None
+    """DEPRECATED: Use source_mesh instead"""
+    
+    lmk_path: Optional[Path] = None
+    """DEPRECATED: Use source_lmk instead"""
+    
+    flame_reference: Optional[Path] = None
+    """DEPRECATED: Use target_flame_ref instead"""
+    
+    dataset_path: Optional[Path] = None
+    """DEPRECATED: Use target_flame_ref instead"""
+    
+    def __post_init__(self):
+        """Validate configuration and handle deprecated parameters."""
+        import warnings
+        
+        # Handle deprecated parameters
+        if self.mesh_path is not None:
+            warnings.warn("--mesh-path is deprecated, use --source-mesh instead", DeprecationWarning)
+            if self.source_mesh == Path(""):  # Check if source_mesh was not set
+                self.source_mesh = self.mesh_path
+        
+        if self.lmk_path is not None:
+            warnings.warn("--lmk-path is deprecated, use --source-lmk instead", DeprecationWarning)
+            if self.source_lmk == Path(""):
+                self.source_lmk = self.lmk_path
+        
+        if self.flame_reference is not None:
+            warnings.warn("--flame-reference is deprecated, use --target-flame-ref instead", DeprecationWarning)
+            if self.target_flame_ref is None:
+                self.target_flame_ref = self.flame_reference
+        
+        if self.dataset_path is not None:
+            warnings.warn("--dataset-path is deprecated, use --target-flame-ref instead", DeprecationWarning)
+            if self.target_flame_ref is None:
+                self.target_flame_ref = self.dataset_path
+        
+        # Validate target mode
+        if self.target_mode not in ["flame", "custom"]:
+            raise ValueError(
+                f"Invalid target_mode: '{self.target_mode}'\n"
+                f"  Must be 'flame' or 'custom'\n"
+                f"  Use 'flame' to align to FLAME reference\n"
+                f"  Use 'custom' to align to custom mesh"
+            )
+        
+        # Validate target mode parameters
+        if self.target_mode == "flame":
+            if self.target_flame_ref is None:
+                raise ValueError(
+                    "FLAME target mode requires --target-flame-ref\n"
+                    "  Provide either:\n"
+                    "    - Path to GaussianAvatars dataset folder (with transforms_train.json)\n"
+                    "    - Path to FLAME .obj file"
+                )
+        elif self.target_mode == "custom":
+            if self.target_mesh is None or self.target_lmk is None:
+                raise ValueError(
+                    "Custom target mode requires both --target-mesh and --target-lmk\n"
+                    f"  target_mesh: {self.target_mesh}\n"
+                    f"  target_lmk: {self.target_lmk}"
+                )
+        
+        # Validate source inputs
+        if not self.source_mesh.exists():
+            raise FileNotFoundError(f"Source mesh not found: {self.source_mesh}")
+        if not self.source_lmk.exists():
+            raise FileNotFoundError(f"Source landmarks not found: {self.source_lmk}")
 
 
 
@@ -113,12 +202,12 @@ class AlignmentResult:
     """Complete alignment results for comprehensive output."""
     
     # Input data
-    flame_mesh_vertices: np.ndarray
-    flame_mesh_faces: np.ndarray
-    flame_landmarks: np.ndarray
-    user_mesh_vertices: np.ndarray
-    user_mesh_faces: np.ndarray
-    user_landmarks_original: np.ndarray
+    target_mesh_vertices: np.ndarray
+    target_mesh_faces: np.ndarray
+    target_landmarks: np.ndarray
+    source_mesh_vertices: np.ndarray
+    source_mesh_faces: np.ndarray
+    source_landmarks_original: np.ndarray
     
     # Transformation components
     transform_matrix: np.ndarray  # 4×4
@@ -127,8 +216,8 @@ class AlignmentResult:
     translation_vector: np.ndarray  # 3
     
     # Transformed outputs
-    user_mesh_aligned_vertices: np.ndarray
-    user_landmarks_aligned: np.ndarray
+    source_mesh_aligned_vertices: np.ndarray
+    source_landmarks_aligned: np.ndarray
     
     # Quality metrics
     mean_lmk_error: float
@@ -136,8 +225,8 @@ class AlignmentResult:
     std_lmk_error: float
     per_landmark_errors: np.ndarray
     
-    # FLAME mesh with static_offset (optional)
-    flame_mesh_with_offset_vertices: Optional[np.ndarray] = None
+    # Target mesh metadata (optional, for FLAME mode)
+    target_mesh_with_offset_vertices: Optional[np.ndarray] = None
     
     # Timing info
     execution_time: float = 0.0
@@ -877,50 +966,50 @@ def create_interactive_html_viewer(
     
     fig = go.Figure()
     
-    # Layer 1: FLAME Template (light gray, semi-transparent)
+    # Layer 1: Target Template (light gray, semi-transparent)
     if show_flame:
         fig.add_trace(go.Mesh3d(
-            x=result.flame_mesh_vertices[:, 0],
-            y=result.flame_mesh_vertices[:, 1],
-            z=result.flame_mesh_vertices[:, 2],
-            i=result.flame_mesh_faces[:, 0],
-            j=result.flame_mesh_faces[:, 1],
-            k=result.flame_mesh_faces[:, 2],
+            x=result.target_mesh_vertices[:, 0],
+            y=result.target_mesh_vertices[:, 1],
+            z=result.target_mesh_vertices[:, 2],
+            i=result.target_mesh_faces[:, 0],
+            j=result.target_mesh_faces[:, 1],
+            k=result.target_mesh_faces[:, 2],
             color='lightgray',
             opacity=0.3,
-            name='FLAME Template',
+            name='Target Mesh',
             hoverinfo='skip',
             lighting=dict(ambient=0.8, diffuse=0.5, specular=0.1),
             lightposition=dict(x=100, y=100, z=100)
         ))
     
-    # Layer 2: Aligned User Mesh (green, semi-transparent)
+    # Layer 2: Aligned Source Mesh (green, semi-transparent)
     if show_user_mesh:
         fig.add_trace(go.Mesh3d(
-            x=result.user_mesh_aligned_vertices[:, 0],
-            y=result.user_mesh_aligned_vertices[:, 1],
-            z=result.user_mesh_aligned_vertices[:, 2],
-            i=result.user_mesh_faces[:, 0],
-            j=result.user_mesh_faces[:, 1],
-            k=result.user_mesh_faces[:, 2],
+            x=result.source_mesh_aligned_vertices[:, 0],
+            y=result.source_mesh_aligned_vertices[:, 1],
+            z=result.source_mesh_aligned_vertices[:, 2],
+            i=result.source_mesh_faces[:, 0],
+            j=result.source_mesh_faces[:, 1],
+            k=result.source_mesh_faces[:, 2],
             color='lightgreen',
             opacity=0.6,
-            name='Aligned User Mesh',
+            name='Aligned Source Mesh',
             hoverinfo='skip',
             lighting=dict(ambient=0.9, diffuse=0.6, specular=0.2)
         ))
     
-    # Layer 3: FLAME Landmarks (blue with index labels)
+    # Layer 3: Target Landmarks (blue with index labels)
     errors_mm = result.per_landmark_errors * 1000  # Convert to mm
     
     fig.add_trace(go.Scatter3d(
-        x=result.flame_landmarks[:, 0],
-        y=result.flame_landmarks[:, 1],
-        z=result.flame_landmarks[:, 2],
+        x=result.target_landmarks[:, 0],
+        y=result.target_landmarks[:, 1],
+        z=result.target_landmarks[:, 2],
         mode='markers+text',
-        name='FLAME Landmarks',
-        text=[str(i) for i in range(len(result.flame_landmarks))],
-        # Swapped: place FLAME labels below the points for clearer separation
+        name='Target Landmarks',
+        text=[str(i) for i in range(len(result.target_landmarks))],
+        # Place target labels below the points for clearer separation
         textposition='bottom center',
         textfont=dict(size=8, color='darkblue'),
         marker=dict(
@@ -930,25 +1019,25 @@ def create_interactive_html_viewer(
             line=dict(color='darkblue', width=1)
         ),
         hovertemplate=(
-            '<b>FLAME Landmark %{customdata[0]}</b><br>' +
+            '<b>Target Landmark %{customdata[0]}</b><br>' +
             'Position: (%{x:.4f}, %{y:.4f}, %{z:.4f})<br>' +
             '<extra></extra>'
         ),
         customdata=np.column_stack([
-            np.arange(len(result.flame_landmarks)),
+            np.arange(len(result.target_landmarks)),
             errors_mm
         ])
     ))
     
-    # Layer 4: User Aligned Landmarks (green with index labels)
+    # Layer 4: Source Aligned Landmarks (green with index labels)
     fig.add_trace(go.Scatter3d(
-        x=result.user_landmarks_aligned[:, 0],
-        y=result.user_landmarks_aligned[:, 1],
-        z=result.user_landmarks_aligned[:, 2],
+        x=result.source_landmarks_aligned[:, 0],
+        y=result.source_landmarks_aligned[:, 1],
+        z=result.source_landmarks_aligned[:, 2],
         mode='markers+text',
-        name='User Aligned Landmarks',
-        text=[str(i) for i in range(len(result.user_landmarks_aligned))],
-        # Swapped: place user labels above the points to avoid overlap with FLAME labels
+        name='Source Aligned Landmarks',
+        text=[str(i) for i in range(len(result.source_landmarks_aligned))],
+        # Place source labels above the points to avoid overlap with target labels
         textposition='top center',
         textfont=dict(size=8, color='darkgreen'),
         marker=dict(
@@ -958,24 +1047,24 @@ def create_interactive_html_viewer(
             line=dict(color='darkgreen', width=1)
         ),
         hovertemplate=(
-            '<b>User Landmark %{customdata[0]}</b><br>' +
+            '<b>Source Landmark %{customdata[0]}</b><br>' +
             'Position: (%{x:.4f}, %{y:.4f}, %{z:.4f})<br>' +
             'Alignment Error: %{customdata[1]:.4f} mm<br>' +
             '<extra></extra>'
         ),
         customdata=np.column_stack([
-            np.arange(len(result.user_landmarks_aligned)),
+            np.arange(len(result.source_landmarks_aligned)),
             errors_mm
         ])
     ))
     
     # Layer 5: Error vectors (connecting corresponding landmarks)
-    # Create lines connecting FLAME landmark to aligned user landmark
-    for i in range(len(result.flame_landmarks)):
+    # Create lines connecting target landmark to aligned source landmark
+    for i in range(len(result.target_landmarks)):
         fig.add_trace(go.Scatter3d(
-            x=[result.flame_landmarks[i, 0], result.user_landmarks_aligned[i, 0]],
-            y=[result.flame_landmarks[i, 1], result.user_landmarks_aligned[i, 1]],
-            z=[result.flame_landmarks[i, 2], result.user_landmarks_aligned[i, 2]],
+            x=[result.target_landmarks[i, 0], result.source_landmarks_aligned[i, 0]],
+            y=[result.target_landmarks[i, 1], result.source_landmarks_aligned[i, 1]],
+            z=[result.target_landmarks[i, 2], result.source_landmarks_aligned[i, 2]],
             mode='lines',
             line=dict(
                 color=errors_mm[i],
@@ -1010,9 +1099,9 @@ def create_interactive_html_viewer(
         hoverinfo='skip'
     ))
     
-    # Determine default camera based on FLAME landmark distribution
+    # Determine default camera based on target landmark distribution
     try:
-        orientation_info = analyze_landmark_orientation(result.flame_landmarks)
+        orientation_info = analyze_landmark_orientation(result.target_landmarks)
         camera_eye = orientation_info.get('eye', dict(x=1.5, y=1.5, z=1.2))
         print(f"  Info: Landmark orientation axis='{orientation_info.get('axis')}', stds={orientation_info.get('stds')}")
     except Exception:
@@ -1024,7 +1113,7 @@ def create_interactive_html_viewer(
             text=f'Interactive Landmark Alignment Viewer<br>' +
                  f'<sub>Mean Error: {result.mean_lmk_error*1000:.3f}mm | ' +
                  f'Max Error: {result.max_lmk_error*1000:.3f}mm | ' +
-                 f'Landmarks: {len(result.flame_landmarks)}</sub>',
+                 f'Landmarks: {len(result.target_landmarks)}</sub>',
             x=0.5,
             xanchor='center'
         ),
@@ -1155,35 +1244,34 @@ def _save_meshes(mesh_dir: Path, result: AlignmentResult) -> None:
         if mtl_path.exists():
             mtl_path.unlink()
     
-    # FLAME canonical mesh (pure template, no offset)
+    # Target canonical mesh (pure template, no offset)
     export_obj_without_material(
-        result.flame_mesh_vertices,
-        result.flame_mesh_faces,
-        mesh_dir / "flame_canonical_template.obj"
+        result.target_mesh_vertices,
+        result.target_mesh_faces,
+        mesh_dir / "target_mesh_template.obj"
     )
     
-    # FLAME mesh with static_offset (if available)
-    if result.flame_mesh_with_offset_vertices is not None:
+    # Target mesh with static_offset (if available, for FLAME mode)
+    if result.target_mesh_with_offset_vertices is not None:
         export_obj_without_material(
-            result.flame_mesh_with_offset_vertices,
-            result.flame_mesh_faces,
-            mesh_dir / "flame_canonical_with_offset.obj"
+            result.target_mesh_with_offset_vertices,
+            result.target_mesh_faces,
+            mesh_dir / "target_mesh_with_offset.obj"
         )
-        print(f"  ✓ {mesh_dir / 'flame_canonical_with_offset.obj'} (matches FlameGaussian training)")
+        print(f"  ✓ {mesh_dir / 'target_mesh_with_offset.obj'} (matches FlameGaussian training)")
     
-    # User mesh original
+    # Source mesh original
     export_obj_without_material(
-        result.user_mesh_vertices,
-        result.user_mesh_faces,
-        mesh_dir / "user_mesh_original.obj"
+        result.source_mesh_vertices,
+        result.source_mesh_faces,
+        mesh_dir / "source_mesh_original.obj"
     )
     
-    # User mesh aligned
-    # User mesh aligned
+    # Source mesh aligned
     export_obj_without_material(
-        result.user_mesh_aligned_vertices,
-        result.user_mesh_faces,
-        mesh_dir / "user_mesh_aligned.obj"
+        result.source_mesh_aligned_vertices,
+        result.source_mesh_faces,
+        mesh_dir / "source_mesh_aligned.obj"
     )
     
     print(f"  ✓ Saved 3 mesh files to {mesh_dir}/")
@@ -1192,11 +1280,11 @@ def _save_meshes(mesh_dir: Path, result: AlignmentResult) -> None:
 def _save_landmarks(lmk_dir: Path, result: AlignmentResult) -> None:
     """Save landmark arrays in NPY format."""
     
-    np.save(lmk_dir / "flame_landmarks.npy", result.flame_landmarks)
+    np.save(lmk_dir / "target_landmarks.npy", result.target_landmarks)
     
-    np.save(lmk_dir / "user_landmarks_original.npy", result.user_landmarks_original)
+    np.save(lmk_dir / "source_landmarks_original.npy", result.source_landmarks_original)
     
-    np.save(lmk_dir / "user_landmarks_aligned.npy", result.user_landmarks_aligned)
+    np.save(lmk_dir / "source_landmarks_aligned.npy", result.source_landmarks_aligned)
     
     np.save(lmk_dir / "per_landmark_errors.npy", result.per_landmark_errors)
     
@@ -1278,11 +1366,11 @@ def _save_alignment_report(log_dir: Path, cfg: AlignmentConfig, result: Alignmen
         # Mesh statistics
         f.write("MESH STATISTICS\n")
         f.write("-" * 80 + "\n")
-        f.write(f"User Mesh (Original):  {len(result.user_mesh_vertices):,} vertices, ")
-        f.write(f"{len(result.user_mesh_faces):,} faces\n")
-        f.write(f"FLAME Template:        {len(result.flame_mesh_vertices):,} vertices, ")
-        f.write(f"{len(result.flame_mesh_faces):,} faces\n")
-        f.write(f"Landmarks:             {len(result.flame_landmarks)} points\n\n")
+        f.write(f"Source Mesh (Original):  {len(result.source_mesh_vertices):,} vertices, ")
+        f.write(f"{len(result.source_mesh_faces):,} faces\n")
+        f.write(f"Target Mesh:             {len(result.target_mesh_vertices):,} vertices, ")
+        f.write(f"{len(result.target_mesh_faces):,} faces\n")
+        f.write(f"Landmarks:               {len(result.target_landmarks)} points\n\n")
         
         # Alignment results
         f.write("ALIGNMENT RESULTS\n")
@@ -1314,7 +1402,8 @@ def _save_alignment_report(log_dir: Path, cfg: AlignmentConfig, result: Alignmen
                 f.write(f"  - {key:20s} {val:.3f} sec\n")
         f.write("\n")
         
-        f.write(f"Result --mesh-path {cfg.output_dir}/meshes/user_mesh_aligned.obj\n")
+        f.write(f"  Result: Aligned source mesh saved as:\n")
+        f.write(f"          {cfg.output_dir}/meshes/source_mesh_aligned.obj\n")
         f.write("=" * 80 + "\n")
     
     print(f"  ✓ {report_path}")
@@ -1361,25 +1450,25 @@ def visualize_results(
         fig = plt.figure(figsize=(12, 10))
         ax = fig.add_subplot(111, projection='3d')
         
-        # Plot FLAME landmarks (blue)
+        # Plot target landmarks (blue)
         ax.scatter(
-            result.flame_landmarks[:, 0],
-            result.flame_landmarks[:, 1],
-            result.flame_landmarks[:, 2],
-            c='blue', s=80, alpha=0.7, label='FLAME landmarks', marker='o', edgecolors='darkblue', linewidths=1.5
+            result.target_landmarks[:, 0],
+            result.target_landmarks[:, 1],
+            result.target_landmarks[:, 2],
+            c='blue', s=80, alpha=0.7, label='Target landmarks', marker='o', edgecolors='darkblue', linewidths=1.5
         )
         
-        # Plot aligned user landmarks (green)
+        # Plot aligned source landmarks (green)
         ax.scatter(
-            result.user_landmarks_aligned[:, 0],
-            result.user_landmarks_aligned[:, 1],
-            result.user_landmarks_aligned[:, 2],
-            c='green', s=80, alpha=0.7, label='Aligned user landmarks', marker='^', edgecolors='darkgreen', linewidths=1.5
+            result.source_landmarks_aligned[:, 0],
+            result.source_landmarks_aligned[:, 1],
+            result.source_landmarks_aligned[:, 2],
+            c='green', s=80, alpha=0.7, label='Aligned source landmarks', marker='^', edgecolors='darkgreen', linewidths=1.5
         )
         
         # Draw correspondence lines between matching landmarks
         errors_mm = result.per_landmark_errors * 1000
-        for i in range(len(result.flame_landmarks)):
+        for i in range(len(result.target_landmarks)):
             # Color code lines by error magnitude
             error = errors_mm[i]
             if error < 5:
@@ -1393,31 +1482,31 @@ def visualize_results(
                 alpha = 0.7
             
             ax.plot(
-                [result.flame_landmarks[i, 0], result.user_landmarks_aligned[i, 0]],
-                [result.flame_landmarks[i, 1], result.user_landmarks_aligned[i, 1]],
-                [result.flame_landmarks[i, 2], result.user_landmarks_aligned[i, 2]],
+                [result.target_landmarks[i, 0], result.source_landmarks_aligned[i, 0]],
+                [result.target_landmarks[i, 1], result.source_landmarks_aligned[i, 1]],
+                [result.target_landmarks[i, 2], result.source_landmarks_aligned[i, 2]],
                 color=color, alpha=alpha, linewidth=1.0
             )
         
         # Add landmark indices (show every 5th to avoid clutter)
-        for i in range(0, len(result.flame_landmarks), 5):
-            # FLAME landmark index (blue)
+        for i in range(0, len(result.target_landmarks), 5):
+            # Target landmark index (blue)
             ax.text(
-                result.flame_landmarks[i, 0],
-                result.flame_landmarks[i, 1],
-                result.flame_landmarks[i, 2],
+                result.target_landmarks[i, 0],
+                result.target_landmarks[i, 1],
+                result.target_landmarks[i, 2],
                 str(i), fontsize=7, color='darkblue', fontweight='bold'
             )
-            # User landmark index (green, slightly offset)
+            # Source landmark index (green, slightly offset)
             ax.text(
-                result.user_landmarks_aligned[i, 0],
-                result.user_landmarks_aligned[i, 1],
-                result.user_landmarks_aligned[i, 2] + 0.02,
+                result.source_landmarks_aligned[i, 0],
+                result.source_landmarks_aligned[i, 1],
+                result.source_landmarks_aligned[i, 2] + 0.02,
                 str(i), fontsize=7, color='darkgreen', fontweight='bold'
             )
         
         ax.set_title(
-            f'Landmark Alignment Correspondence (n={len(result.flame_landmarks)})\n'
+            f'Landmark Alignment Correspondence (n={len(result.target_landmarks)})\n'
             f'Mean Error: {result.mean_lmk_error*1000:.3f}mm | Max: {result.max_lmk_error*1000:.3f}mm',
             fontsize=12, fontweight='bold'
         )
@@ -1508,25 +1597,25 @@ class FineTuningViewer(Mini3DViewer):
         self.mesh_renderer = NVDiffRenderer(use_opengl=False) # Use CUDA rasterizer
         
         # Prepare Meshes for Rendering
-        # 1. FLAME Reference (Static, Light Gray, Transparent)
-        self.flame_verts = torch.from_numpy(result.flame_mesh_vertices).float().cuda().unsqueeze(0) # [1, V, 3]
-        faces = result.flame_mesh_faces.numpy() if hasattr(result.flame_mesh_faces, 'numpy') else result.flame_mesh_faces
+        # 1. Target Reference (Static, Light Gray, Transparent)
+        self.target_verts = torch.from_numpy(result.target_mesh_vertices).float().cuda().unsqueeze(0) # [1, V, 3]
+        faces = result.target_mesh_faces.numpy() if hasattr(result.target_mesh_faces, 'numpy') else result.target_mesh_faces
         if isinstance(faces, torch.Tensor): faces = faces.cpu().numpy()
-        self.flame_faces = torch.from_numpy(faces).int().cuda()
+        self.target_faces = torch.from_numpy(faces).int().cuda()
         
-        self.flame_color = torch.tensor([0.7, 0.7, 0.7, 0.5]).cuda() # RGBA
-        self.flame_face_colors = self.flame_color[:3].view(1, 1, 3).expand(1, self.flame_faces.shape[0], 3)
+        self.target_color = torch.tensor([0.7, 0.7, 0.7, 0.5]).cuda() # RGBA
+        self.target_face_colors = self.target_color[:3].view(1, 1, 3).expand(1, self.target_faces.shape[0], 3)
         
-        # 2. User Mesh (Dynamic, Light Green, Transparent)
-        self.user_verts_orig = torch.from_numpy(result.user_mesh_vertices).float().cuda().unsqueeze(0) # [1, V, 3]
-        faces_u = result.user_mesh_faces
-        self.user_faces = torch.from_numpy(faces_u).int().cuda()
+        # 2. Source Mesh (Dynamic, Light Green, Transparent)
+        self.source_verts_orig = torch.from_numpy(result.source_mesh_vertices).float().cuda().unsqueeze(0) # [1, V, 3]
+        faces_u = result.source_mesh_faces
+        self.source_faces = torch.from_numpy(faces_u).int().cuda()
         
-        self.user_color = torch.tensor([0.2, 0.8, 0.2, 0.6]).cuda() # RGBA
-        self.user_face_colors = self.user_color[:3].view(1, 1, 3).expand(1, self.user_faces.shape[0], 3)
+        self.source_color = torch.tensor([0.2, 0.8, 0.2, 0.6]).cuda() # RGBA
+        self.source_face_colors = self.source_color[:3].view(1, 1, 3).expand(1, self.source_faces.shape[0], 3)
         
-        # Current transformed user vertices (will be updated)
-        self.user_verts_transformed = self.user_verts_orig.clone()
+        # Current transformed source vertices (will be updated)
+        self.source_verts_transformed = self.source_verts_orig.clone()
         
         # Initial update
         self.update_transform_logical()
@@ -1549,12 +1638,12 @@ class FineTuningViewer(Mini3DViewer):
         T_torch = torch.from_numpy(self.current_transform).float().cuda()
         
         # Homogeneous coordinate transform
-        # user_verts_orig: [1, V, 3] -> [V, 3]
-        v = self.user_verts_orig[0] 
+        # source_verts_orig: [1, V, 3] -> [V, 3]
+        v = self.source_verts_orig[0] 
         v_homo = torch.cat([v, torch.ones_like(v[:, :1])], dim=1) # [V, 4]
         v_new = (T_torch @ v_homo.T).T # [V, 4]
         
-        self.user_verts_transformed = v_new[:, :3].unsqueeze(0) # [1, V, 3]
+        self.source_verts_transformed = v_new[:, :3].unsqueeze(0) # [1, V, 3]
 
     def define_gui(self):
         super().define_gui()
@@ -1565,7 +1654,7 @@ class FineTuningViewer(Mini3DViewer):
             dpg.add_separator()
             
             dpg.add_text("Instructions:")
-            dpg.add_text("- Adjust sliders to align Green Mesh (User) to Gray Mesh (FLAME)")
+            dpg.add_text("- Adjust sliders to align Green Mesh (Source) to Gray Mesh (Target)")
             dpg.add_text("- Use Mouse Left/Right to Rotate/Pan Camera")
             dpg.add_text("- Scroll to Zoom")
             dpg.add_separator()
@@ -1807,30 +1896,30 @@ class FineTuningViewer(Mini3DViewer):
             if self.need_update:
                 cam = self.prepare_camera()
                 
-                # Render FLAME (Static Reference)
-                out_flame = self.mesh_renderer.render_from_camera(
-                    self.flame_verts, 
-                    self.flame_faces, 
+                # Render Target (Static Reference)
+                out_target = self.mesh_renderer.render_from_camera(
+                    self.target_verts, 
+                    self.target_faces, 
                     cam, 
-                    face_colors=self.flame_face_colors
+                    face_colors=self.target_face_colors
                 )
-                rgba_flame = out_flame['rgba'].squeeze(0) # [H, W, 4]
+                rgba_target = out_target['rgba'].squeeze(0) # [H, W, 4]
                 
-                # Render User Mesh (Dynamic)
-                out_user = self.mesh_renderer.render_from_camera(
-                    self.user_verts_transformed,
-                    self.user_faces,
+                # Render Source Mesh (Dynamic)
+                out_source = self.mesh_renderer.render_from_camera(
+                    self.source_verts_transformed,
+                    self.source_faces,
                     cam,
-                    face_colors=self.user_face_colors
+                    face_colors=self.source_face_colors
                 )
-                rgba_user = out_user['rgba'].squeeze(0) # [H, W, 4]
+                rgba_source = out_source['rgba'].squeeze(0) # [H, W, 4]
                 
                 # Composite
-                # Simple alpha compositing: User over FLAME over White Background
+                # Simple alpha compositing: Source over Target over White Background
                 bg_color = torch.tensor([1.0, 1.0, 1.0, 1.0]).cuda().view(1, 1, 4)
                 
-                # Mix User over FLAME
-                # out = user * user_a + flame * flame_a * (1 - user_a)
+                # Mix Source over Target
+                # out = source * source_a + target * target_a * (1 - source_a)
                 # But we have pre-multiplied alpha or not? setup in render_from_camera seems to return [RGB, A]
                 
                 # Let's do simple manual composition
@@ -1838,18 +1927,18 @@ class FineTuningViewer(Mini3DViewer):
                 # USE cam snapshot dimensions to ensure match with renderer output
                 canvas = bg_color.expand(cam.image_height, cam.image_width, 4).clone()
                 
-                if canvas.shape[0] != rgba_flame.shape[0] or canvas.shape[1] != rgba_flame.shape[1]:
-                    print(f"Warning: Resize detected. Canvas: {canvas.shape}, Flame: {rgba_flame.shape}")
+                if canvas.shape[0] != rgba_target.shape[0] or canvas.shape[1] != rgba_target.shape[1]:
+                    print(f"Warning: Resize detected. Canvas: {canvas.shape}, Target: {rgba_target.shape}")
                     # Skip frame if mismatch (though using cam.* should prevent this)
-                    canvas = bg_color.expand(rgba_flame.shape[0], rgba_flame.shape[1], 4).clone()
+                    canvas = bg_color.expand(rgba_target.shape[0], rgba_target.shape[1], 4).clone()
 
-                # 2. Add FLAME
-                flame_alpha = rgba_flame[..., 3:] * self.flame_color[3]
-                canvas = rgba_flame * flame_alpha + canvas * (1 - flame_alpha)
+                # 2. Add Target
+                target_alpha = rgba_target[..., 3:] * self.target_color[3]
+                canvas = rgba_target * target_alpha + canvas * (1 - target_alpha)
                 
-                # 3. Add User
-                user_alpha = rgba_user[..., 3:] * self.user_color[3]
-                canvas = rgba_user * user_alpha + canvas * (1 - user_alpha)
+                # 3. Add Source
+                source_alpha = rgba_source[..., 3:] * self.source_color[3]
+                canvas = rgba_source * source_alpha + canvas * (1 - source_alpha)
                 
                 # Convert to numpy for display
                 # DPG requires contiguous float32 buffer
@@ -1891,23 +1980,26 @@ def main(cfg: AlignmentConfig) -> None:
     timing = {}
     
     print("="*80)
-    print("FLAME Mesh Alignment Tool - Enhanced Version")
+    print("Mesh Alignment Tool - Source → Target")
     print("="*80)
-    print(f"Input mesh:      {cfg.mesh_path}")
-    print(f"Input landmarks: {cfg.lmk_path}")
-    print(f"Output dir:      {cfg.output_dir}")
+    print(f"Source mesh:      {cfg.source_mesh}")
+    print(f"Source landmarks: {cfg.source_lmk}")
+    print(f"Target mode:      {cfg.target_mode}")
+    if cfg.target_mode == "flame":
+        print(f"FLAME reference:  {cfg.target_flame_ref}")
+    else:
+        print(f"Target mesh:      {cfg.target_mesh}")
+        print(f"Target landmarks: {cfg.target_lmk}")
+    print(f"Output dir:       {cfg.output_dir}")
     print("="*80 + "\n")
     
-    # Step 1: Load FLAME model and canonical landmarks
-    print(f"\n[1/6] Loading FLAME model and computing canonical landmarks...")
+    # ========== STEP 1: Load Target (FLAME or Custom) ==========
+    print(f"\n[1/6] Loading target mesh and landmarks...")
     t0 = time()
     
-    # Handle deprecated dataset_path parameter
-    flame_ref = cfg.flame_reference or cfg.dataset_path
-    
-    if flame_ref is not None:
-        # Use provided flame_reference (dataset folder or obj file)
-        print(f"\n  Using flame_reference: {flame_ref}")
+    if cfg.target_mode == "flame":
+        # MODE 1: FLAME Reference
+        print(f"  Using FLAME reference: {cfg.target_flame_ref}")
         
         # Load FlameHead model (for topology and/or mesh generation)
         flame_model, _, _ = load_flame_model_and_landmarks(
@@ -1915,155 +2007,129 @@ def main(cfg: AlignmentConfig) -> None:
         )
         
         # Load reference mesh and compute landmarks
-        flame_mesh_vertices, flame_landmarks = load_flame_reference_with_landmarks(
-            flame_ref, flame_model, cfg.landmark_type
+        target_vertices, target_landmarks = load_flame_reference_with_landmarks(
+            cfg.target_flame_ref, flame_model, cfg.landmark_type
         )
+        target_faces = flame_model.faces.numpy() if isinstance(flame_model.faces, torch.Tensor) else flame_model.faces
+        
+        print(f"  ✓ Loaded FLAME target: {len(target_vertices):,} vertices, {len(target_faces):,} faces")
+        print(f"  ✓ Computed {len(target_landmarks)} FLAME landmarks")
+        
     else:
-        # Fallback: Use FLAME v_template
-        print(f"\n  No flame_reference provided, using FLAME v_template")
-        flame_model, flame_landmarks, _ = load_flame_model_and_landmarks(
-            cfg.n_shape, cfg.n_expr, cfg.add_teeth, cfg.landmark_type, None
-        )
-        flame_mesh_vertices = flame_model.v_template.cpu().numpy()
+        # MODE 2: Custom Mesh
+        print(f"  Using custom target: {cfg.target_mesh}")
+        
+        # Load target mesh
+        target_mesh = trimesh.load(cfg.target_mesh, process=False)
+        target_vertices = target_mesh.vertices
+        target_faces = target_mesh.faces
+        
+        # Load target landmarks
+        target_landmarks = load_user_landmarks(cfg.target_lmk, expected_count=None)
+        
+        print(f"  ✓ Loaded custom target: {len(target_vertices):,} vertices, {len(target_faces):,} faces")
+        print(f"  ✓ Loaded {len(target_landmarks)} target landmarks")
     
-    timing['FLAME loading'] = time() - t0
+    timing['Target loading'] = time() - t0
     
-    # Step 2: Load user mesh
-    print(f"\n[2/6] Loading user mesh from {cfg.mesh_path}...")
+    #  ========== STEP 2: Load Source Mesh ==========
+    print(f"\n[2/6] Loading source mesh from {cfg.source_mesh}...")
     t0 = time()
-    if not cfg.mesh_path.exists():
-        raise FileNotFoundError(f"Mesh file not found: {cfg.mesh_path}")
-    user_mesh = trimesh.load(cfg.mesh_path, process=False)
-    print(f"Loaded mesh with {len(user_mesh.vertices):,} vertices, {len(user_mesh.faces):,} faces")
-    timing['User mesh loading'] = time() - t0
+    source_mesh = trimesh.load(cfg.source_mesh, process=False)
+    print(f"  ✓ Loaded source mesh: {len(source_mesh.vertices):,} vertices, {len(source_mesh.faces):,} faces")
+    timing['Source mesh loading'] = time() - t0
     
-    # Step 3: Load user landmarks with adaptive conversion
-    print(f"\n[3/6] Loading user landmarks from {cfg.lmk_path}...")
+    # ========== STEP 3: Load Source Landmarks with Adaptive Conversion ==========
+    print(f"\n[3/6] Loading source landmarks from {cfg.source_lmk}...")
     t0 = time()
-    if not cfg.lmk_path.exists():
-        raise FileNotFoundError(f"Landmark file not found: {cfg.lmk_path}")
     
     # Load landmarks without validation first
-    user_landmarks = load_user_landmarks(cfg.lmk_path, expected_count=None)
-    actual_count = len(user_landmarks)
-    expected_count = len(flame_landmarks)
+    source_landmarks = load_user_landmarks(cfg.source_lmk, expected_count=None)
+    source_count = len(source_landmarks)
+    target_count = len(target_landmarks)
     
-    print(f"  Detected {actual_count} input landmarks, target mode: {cfg.landmark_type} ({expected_count} points)")
+    print(f"  Detected source: {source_count} landmarks, target: {target_count} landmarks")
+    print(f"  Alignment strategy: {cfg.landmark_type}")
     
-    # Optimized adaptive conversion supporting 51, 53, 68, 70 formats
-    if cfg.landmark_type == "static" and expected_count == 53:
-        # ========== TARGET: Static mode (53 points) ==========
-        if actual_count == 68:
-            # 68 → 51: Remove face contour [0:17], keep facial features [17:68]
-            print(f"  🔄 Converting 68-point format → 51 facial features (removing contour [0:17])")
-            user_landmarks = user_landmarks[LANDMARK_FORMAT_68_TO_51_INDICES]
-            print(f"  ⚠️  Result: 51 facial points (missing 2 eyeball centers)")
-            print(f"  💡 Note: Alignment will use 51-point subset (FLAME static has 53)")
-            
-        elif actual_count == 51:
-            # 51: Facial features only, no eyeballs
-            print(f"  ✓ Using 51 facial feature landmarks")
-            print(f"  ⚠️  Missing 2 eyeball centers (FLAME static has 53)")
-            print(f"  💡 Note: Alignment will use 51-point subset")
-            
-        elif actual_count == 53:
-            # 53: Perfect match
-            print(f"  ✅ Perfect match: 53 static landmarks (51 facial + 2 eyeballs)")
-            
-        elif actual_count == 70:
-            # 70 → 53: Extract static subset [17:70]
-            print(f"  🔄 Converting 70-point format → 53 static landmarks (extracting [17:70])")
-            user_landmarks = user_landmarks[LANDMARK_FORMAT_70_TO_53_INDICES]
-            print(f"  ✅ Converted to 53 static landmarks")
-            
+    # ========== Alignment Strategy-Based Conversion ==========
+    if cfg.landmark_type == "static":
+        # STATIC MODE: Flexible - convert both to 51 facial points (remove contour)
+        print(f"\n  📐 Static alignment mode: converting both to 51 facial points...")
+        
+        # Convert source to 51 points
+        if source_count == 68:
+            print(f"    Source: 68 → 51 (removing contour [0:17])")
+            source_landmarks = source_landmarks[LANDMARK_FORMAT_68_TO_51_INDICES]
+        elif source_count == 70:
+            print(f"    Source: 70 → 51 (extracting facial subset [17:68])")
+            source_landmarks = source_landmarks[LANDMARK_FORMAT_68_TO_51_INDICES]
+        elif source_count == 53:
+            print(f"    Source: 53 → 51 (removing 2 eyeball centers)")
+            source_landmarks = source_landmarks[:51]  # First 51 are facial points
+        elif source_count == 51:
+            print(f"    Source: 51 ✓ (already facial points)")
         else:
             raise ValueError(
-                f"❌ Unsupported landmark count for static mode: {actual_count}\n"
-                f"  Supported formats:\n"
-                f"    • 68 points → auto-convert to 51 (remove contour)\n"
-                f"    • 51 points → use as-is (missing 2 eyeballs)\n"
-                f"    • 53 points → perfect match ✅\n"
-                f"    • 70 points → auto-convert to 53 (extract static subset)\n"
-                f"  File: {cfg.lmk_path}"
+                f"❌ Unsupported source landmark count for static mode: {source_count}\n"
+                f"  Supported: 51, 53, 68, 70\n"
+                f"  File: {cfg.source_lmk}"
             )
-    
-    elif cfg.landmark_type == "full" and expected_count == 70:
-        # ========== TARGET: Full mode (70 points) ==========
-        if actual_count == 68:
-            # 68 → 68 subset of 70: Use corresponding subset from FLAME landmarks
-            # 68-point = [0:17] face contour + [17:68] facial features
-            # 70-point = [0:17] face contour + [17:70] facial features (51) + eye region (17)
-            # Strategy: Extract FLAME landmarks [0:17] + [17:70] to match 68 input points
-            print(f"  🔄 Using 68-point format with 70-point FLAME subset")
-            print(f"  📌 68-point = [0:17] contour + [17:68] features")
-            print(f"  📌 FLAME subset = [0:17] contour + [17:70] features+eyes")
-            print(f"  ⚠️  Note: Using 68 of 70 FLAME landmarks for alignment")
-            # No conversion needed for user_landmarks, but we'll trim FLAME landmarks later
-            # Mark this case for partial landmark handling below
-            
-        elif actual_count == 51:
-            # 51 → 70: Cannot convert (no eyeballs)
-            raise ValueError(
-                f"❌ Cannot convert 51-point to 70-point format\n"
-                f"  Reason: 51-point format lacks eyeballs and eye region details\n"
-                f"  51-point = facial features only (no contour, no eyeballs)\n"
-                f"  70-point = 53 static + 17 eye region details\n"
-                f"  File: {cfg.lmk_path}\n"
-                f"  💡 Suggestion: Use --landmark-type static to align with 51 facial points"
-            )
-            
-        elif actual_count == 53:
-            # 53 → 70: Cannot convert (no eye region details)
-            raise ValueError(
-                f"❌ Cannot convert 53-point to 70-point format\n"
-                f"  Reason: 53-point format lacks eye region details\n"
-                f"  53-point = 51 facial + 2 eyeball centers\n"
-                f"  70-point = 53 static + 17 eye region details\n"
-                f"  File: {cfg.lmk_path}\n"
-                f"  💡 Suggestion: Use --landmark-type static for 53-point alignment"
-            )
-            
-        elif actual_count == 70:
-            # 70: Perfect match
-            print(f"  ✅ Perfect match: 70 full landmarks (53 static + 17 eye region)")
-            
+        
+        # Convert target to 51 points
+        if target_count == 68:
+            print(f"    Target: 68 → 51 (removing contour [0:17])")
+            target_landmarks = target_landmarks[LANDMARK_FORMAT_68_TO_51_INDICES]
+        elif target_count == 70:
+            print(f"    Target: 70 → 51 (extracting facial subset [17:68])")
+            target_landmarks = target_landmarks[LANDMARK_FORMAT_68_TO_51_INDICES]
+        elif target_count == 53:
+            print(f"    Target: 53 → 51 (removing 2 eyeball centers)")
+            target_landmarks = target_landmarks[:51]
+        elif target_count == 51:
+            print(f"    Target: 51 ✓ (already facial points)")
         else:
             raise ValueError(
-                f"❌ Unsupported landmark count for full mode: {actual_count}\n"
-                f"  Supported formats:\n"
-                f"    • 70 points → perfect match ✅\n"
-                f"  Incompatible formats (cannot convert):\n"
-                f"    • 68 points → lacks eye region details\n"
-                f"    • 53 points → lacks eye region details\n"
-                f"    • 51 points → lacks eyeballs and eye region details\n"
-                f"  File: {cfg.lmk_path}\n"
-                f"  💡 Suggestion: Use --landmark-type static for partial alignment"
+                f"❌ Unsupported target landmark count for static mode: {target_count}\n"
+                f"  Supported: 51, 53, 68, 70\n"
+                f"  Note: Target landmarks were loaded from: "
+                f"{cfg.target_lmk if cfg.target_mode == 'custom' else 'FLAME model'}"
             )
+        
+        print(f"  ✅ Final alignment: {len(source_landmarks)} source ↔ {len(target_landmarks)} target points")
+        
+    elif cfg.landmark_type == "full":
+        # FULL MODE: Strict - require 68 points from both
+        print(f"\n  🎯 Full alignment mode: requires 68 points from both source and target...")
+        
+        if source_count != 68:
+            raise ValueError(
+                f"❌ Full mode requires 68-point source landmarks\n"
+                f"  Got: {source_count} points\n"
+                f"  File: {cfg.source_lmk}\n"
+                f"  💡 Suggestion: Use --landmark-type static for flexible alignment"
+            )
+        
+        if target_count != 68:
+            raise ValueError(
+                f"❌ Full mode requires 68-point target landmarks\n"
+                f"  Got: {target_count} points\n"
+                f"  Target: {cfg.target_lmk if cfg.target_mode == 'custom' else 'FLAME (use 70-point format)'}\n"
+                f"  💡 Suggestion: Use --landmark-type static for flexible alignment"
+            )
+        
+        print(f"  ✅ Perfect match: 68 source ↔ 68 target points")
+    
     else:
-        # Unexpected state
-        raise ValueError(
-            f"❌ Landmark validation failed:\n"
-            f"  Mode: {cfg.landmark_type} (expects {expected_count} landmarks)\n"
-            f"  Provided: {actual_count} landmarks\n"
-            f"  File: {cfg.lmk_path}"
-        )
-    
-    # Handle partial alignment case (51 vs 53)
-    final_count = len(user_landmarks)
-    if final_count != expected_count:
-        print(f"  ⚙️  Partial alignment mode: using {final_count} of {expected_count} FLAME landmarks")
-        # Trim FLAME landmarks to match user landmarks (use first N points)
-        flame_landmarks = flame_landmarks[:final_count]
-        print(f"  → FLAME landmarks trimmed to {len(flame_landmarks)} points for alignment")
+        raise ValueError(f"Invalid landmark_type: {cfg.landmark_type} (must be 'static' or 'full')")
     
     timing['Landmark loading'] = time() - t0
     
-    # Step 4: Compute rigid alignment
+    # ========== STEP 4: Compute Rigid Alignment ==========
     print(f"\n[4/6] Computing rigid alignment (Procrustes analysis)...")
     t0 = time()
     transform_matrix, components = compute_rigid_alignment(
-        user_landmarks, 
-        flame_landmarks,
+        source_landmarks, 
+        target_landmarks,
         enable_scaling=cfg.enable_scaling,
         manual_scale=cfg.manual_scale
     )
@@ -2071,37 +2137,37 @@ def main(cfg: AlignmentConfig) -> None:
     
     # Apply transformation
     aligned_vertices = trimesh.transformations.transform_points(
-        user_mesh.vertices, transform_matrix
+        source_mesh.vertices, transform_matrix
     )
     aligned_landmarks = trimesh.transformations.transform_points(
-        user_landmarks, transform_matrix
+        source_landmarks, transform_matrix
     )
     
-    # Step 5: Package results
+    # ========== STEP 5: Package Results ==========
     print(f"\n[5/6] Packaging alignment results...")
     result = AlignmentResult(
         # Input data
-        flame_mesh_vertices=flame_mesh_vertices,  # Use loaded reference mesh
-        flame_mesh_faces=flame_model.faces.numpy() if isinstance(flame_model.faces, torch.Tensor) else flame_model.faces,
-        flame_landmarks=flame_landmarks,
-        user_mesh_vertices=user_mesh.vertices.copy(),
-        user_mesh_faces=user_mesh.faces.copy(),
-        user_landmarks_original=user_landmarks,
+        target_mesh_vertices=target_vertices,
+        target_mesh_faces=target_faces,
+        target_landmarks=target_landmarks,
+        source_mesh_vertices=source_mesh.vertices.copy(),
+        source_mesh_faces=source_mesh.faces.copy(),
+        source_landmarks_original=source_landmarks,
         # Transformation
         transform_matrix=transform_matrix,
         scale_factor=components['scale'],
         rotation_matrix=components['rotation_matrix'],
         translation_vector=components['translation'],
         # Transformed outputs
-        user_mesh_aligned_vertices=aligned_vertices,
-        user_landmarks_aligned=aligned_landmarks,
+        source_mesh_aligned_vertices=aligned_vertices,
+        source_landmarks_aligned=aligned_landmarks,
         # Quality metrics
         mean_lmk_error=components['mean_error'],
         max_lmk_error=components['max_error'],
         std_lmk_error=components['std_error'],
         per_landmark_errors=components['per_landmark_errors'],
-        # FLAME mesh with static_offset
-        flame_mesh_with_offset_vertices=None, # Not applicable when using flame_reference
+        # Target mesh metadata (optional, for FLAME mode)
+        target_mesh_with_offset_vertices=None,
         # Timing
         execution_time=0.0,  # Will be updated
         timing_breakdown=timing
@@ -2124,15 +2190,15 @@ def main(cfg: AlignmentConfig) -> None:
                     result.transform_matrix = data['transform_matrix']
                     
                     # Apply transform to mesh and landmarks
-                    result.user_mesh_aligned_vertices = trimesh.transformations.transform_points(
-                        result.user_mesh_vertices, result.transform_matrix
+                    result.source_mesh_aligned_vertices = trimesh.transformations.transform_points(
+                        result.source_mesh_vertices, result.transform_matrix
                     )
-                    result.user_landmarks_aligned = trimesh.transformations.transform_points(
-                        result.user_landmarks_original, result.transform_matrix
+                    result.source_landmarks_aligned = trimesh.transformations.transform_points(
+                        result.source_landmarks_original, result.transform_matrix
                     )
                     
                     # Re-calc errors
-                    per_lmk_errors = np.sqrt(((result.user_landmarks_aligned - result.flame_landmarks) ** 2).sum(axis=1))
+                    per_lmk_errors = np.sqrt(((result.source_landmarks_aligned - result.target_landmarks) ** 2).sum(axis=1))
                     result.per_landmark_errors = per_lmk_errors
                     result.mean_lmk_error = per_lmk_errors.mean()
                     result.max_lmk_error = per_lmk_errors.max()

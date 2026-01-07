@@ -18,7 +18,7 @@ from scipy.spatial import KDTree
 from scipy.spatial.transform import Rotation
 import heapq
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Literal
 from pathlib import Path
 
 
@@ -55,6 +55,15 @@ class LBSConfig:
     
     debug: bool = False
     """Enable debug output"""
+    
+    seed_mode: Literal["auto", "joint"] = "auto"
+    """Seed selection mode: 'auto' (proximity) or 'joint' (from .pp files)"""
+    
+    joint_files: Optional[Tuple[Path, Path]] = None
+    """Paths to (joint0.pp, joint1.pp) files for 'joint' mode"""
+    
+    pp_unit_scale: float = 1000.0
+    """Scale factor to convert .pp coordinates to skin_vertices units (m -> mm = 1000)"""
 
 
 class LBSController:
@@ -104,12 +113,26 @@ class LBSController:
     
     def _init_weights(self):
         """Calculate skin weights based on geometry"""
-        # 1. Find control seeds
-        if self.config.use_anatomical_regions:
+        # 1. Find control seeds based on mode
+        if self.config.seed_mode == "joint":
+            # Load from .pp files
+            if self.config.joint_files is None:
+                raise ValueError("[LBS] joint_files must be set for seed_mode='joint'")
+            joint0_path, joint1_path = self.config.joint_files
+            
+            # joint0 = skull (static), joint1 = jaw (moving)
+            self.skull_seeds = load_seeds_from_pp_file(
+                joint0_path, self.skin_verts_orig, unit_scale=self.config.pp_unit_scale
+            )
+            self.jaw_seeds = load_seeds_from_pp_file(
+                joint1_path, self.skin_verts_orig, unit_scale=self.config.pp_unit_scale
+            )
+            
+        elif self.config.use_anatomical_regions:
             self.jaw_seeds = self._find_jaw_seeds_anatomical()
             self.skull_seeds = self._find_skull_seeds_anatomical()
         else:
-            # Pure proximity-based (more reliable)
+            # Pure proximity-based (default "auto" mode)
             self.jaw_seeds = self._find_proximal_points(
                 self.skin_verts_orig, 
                 self.jaw_verts_orig, 
@@ -494,6 +517,68 @@ def load_mesh_from_file(filepath: Path) -> Tuple[np.ndarray, np.ndarray]:
     faces = np.array(mesh.faces)
     
     return vertices, faces
+
+
+def load_seeds_from_pp_file(
+    pp_path: Path, 
+    skin_vertices: np.ndarray,
+    unit_scale: float = 1.0
+) -> np.ndarray:
+    """
+    Load seed indices from MeshLab PickedPoints (.pp) XML file.
+    
+    The .pp file contains 3D coordinates. We find the nearest vertex
+    in skin_vertices for each picked point.
+    
+    Args:
+        pp_path: Path to .pp file
+        skin_vertices: Skin mesh vertices [N, 3]
+        unit_scale: Scale factor to convert .pp coordinates to skin_vertices units.
+                    E.g., if .pp is in meters and skin_vertices in mm, use 1000.0
+    
+    Returns:
+        np.ndarray: Vertex indices of seeds
+    """
+    import xml.etree.ElementTree as ET
+    
+    tree = ET.parse(pp_path)
+    root = tree.getroot()
+    
+    # Extract 3D coordinates from <point> elements
+    picked_coords = []
+    for point in root.findall('.//point'):
+        x = float(point.get('x'))
+        y = float(point.get('y'))
+        z = float(point.get('z'))
+        picked_coords.append([x, y, z])
+    
+    if len(picked_coords) == 0:
+        raise ValueError(f"[LBS] No points found in {pp_path}")
+    
+    picked_coords = np.array(picked_coords)
+    
+    # Apply unit scale conversion
+    if unit_scale != 1.0:
+        picked_coords = picked_coords * unit_scale
+        print(f"[LBS] Applied unit_scale={unit_scale} to .pp coordinates")
+    
+    # Find nearest vertex for each picked point
+    kd_tree = KDTree(skin_vertices)
+    distances, indices = kd_tree.query(picked_coords)
+    
+    # Debug: print distance statistics
+    print(f"[LBS] Nearest vertex distances: min={distances.min():.4f}, max={distances.max():.4f}, mean={distances.mean():.4f}")
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_indices = []
+    for idx in indices:
+        if idx not in seen:
+            seen.add(idx)
+            unique_indices.append(idx)
+    
+    print(f"[LBS] Loaded {len(unique_indices)} seeds from {pp_path.name}")
+    return np.array(unique_indices)
 
 
 # Example usage

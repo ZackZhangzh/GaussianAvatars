@@ -60,6 +60,8 @@ class ModelParams(ParamGroup):
         self.not_finetune_flame_params = False
         self.mesh_path = ""  # Path to custom mesh for MeshGaussianModel (no shorthand to avoid conflict with -m/model_path)
         self.optimize_mesh_transform = True  # Whether to optimize mesh rotation/translation (default: enabled)
+        self.point_per_face = 1  # Number of Gaussian points to initialize per mesh face
+        self.init_mesh_transform = "" # Path to .npz file to initialize mesh transform
         self.select_camera_id = -1
         super().__init__(parser, "Loading Parameters", sentinel)
 

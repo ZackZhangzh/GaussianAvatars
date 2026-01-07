@@ -7,6 +7,7 @@
 #
 
 from pathlib import Path
+import os
 import numpy as np
 import torch
 from .gaussian_model import GaussianModel
@@ -30,7 +31,9 @@ class MeshGaussianModel(GaussianModel):
     """
     
     def __init__(self, mesh_path: str, sh_degree: int, 
-                 not_optimize_mesh_transform: bool = False):
+                 not_optimize_mesh_transform: bool = False,
+                 point_per_face: int = 1,
+                 init_mesh_transform: str = ""):
         """
         Initialize MeshGaussianModel with custom mesh.
         
@@ -38,50 +41,55 @@ class MeshGaussianModel(GaussianModel):
             mesh_path: Path to .obj file
             sh_degree: Spherical harmonics degree
             not_optimize_mesh_transform: If True, freeze rotation/translation during training
+            point_per_face: Number of Gaussian points to initialize per mesh face
         """
         super().__init__(sh_degree)
         
         self.mesh_path = Path(mesh_path)
         self.not_optimize_mesh_transform = not_optimize_mesh_transform
+        self.point_per_face = point_per_face
         self.mesh_param = None
         
         # Load mesh and initialize canonical space
-        self._load_custom_mesh()
+        self._load_custom_mesh(init_mesh_transform)
         
-        # Initialize binding (1 point per face, same as FLAME)
+        # Initialize binding (configurable points per face)
         if self.binding is None:
             num_faces = len(self.faces_static)
-            self.binding = torch.arange(num_faces).cuda()
-            self.binding_counter = torch.ones(num_faces, dtype=torch.int32).cuda()
+            # Each face gets point_per_face Gaussians
+            # binding[i] indicates which face point i is bound to
+            # For point_per_face=2, faces=100: binding = [0,0,1,1,2,2,...,99,99]
+            self.binding = torch.repeat_interleave(
+                torch.arange(num_faces, device='cuda'),
+                repeats=self.point_per_face
+            )
+            self.binding_counter = (torch.ones(num_faces, dtype=torch.int32) * self.point_per_face).cuda()
+            total_points = num_faces * self.point_per_face
             print(f"[MeshGaussianModel] Initialized binding: "
-                  f"{num_faces} faces, 1 point/face")
+                  f"{num_faces} faces, {self.point_per_face} point/face, {total_points} total points")
     
-    def _load_custom_mesh(self):
+    def _load_custom_mesh(self, init_mesh_transform=None):
         """
         Load .obj file and initialize canonical space.
         
-        Coordinate system:
-            Input mesh (arbitrary units) 
-                -> Convert to meters
-                -> Center to origin
-                -> Canonical space
+        IMPORTANT: The input mesh is expected to be pre-aligned with the camera 
+        coordinate system (e.g., output from mesh_align_to_flame.py).
+        No automatic unit conversion or centering is applied.
+        
+        If you need to align a raw mesh, use mesh_align_to_flame.py first.
         """
         from utils.lbs import load_mesh_from_file
         
         # Load mesh vertices and faces
         verts_np, faces_np = load_mesh_from_file(self.mesh_path)
         
-        # Unit conversion: assume input is mm, convert to meters (FLAME units)
-        # Auto-detect: if max coordinate > 10, likely in mm
-        if np.abs(verts_np).max() > 10.0:
-            print(f"[MeshGaussianModel] Auto-detected mm units, converting to meters")
-            verts_np = verts_np / 1000.0
-        
-        # Center to origin (canonical space, same as FLAME)
-        verts_centered = verts_np - verts_np.mean(axis=0)
+        # Use mesh as-is (no unit conversion or centering)
+        # The aligned mesh from mesh_align_to_flame.py is already in the correct
+        # coordinate system that matches the camera transforms from the dataset.
+        verts_final = verts_np.astype(np.float32)
         
         # Store as canonical reference
-        self.verts_canonical = torch.from_numpy(verts_centered).float().cuda()[None, ...]
+        self.verts_canonical = torch.from_numpy(verts_final).float().cuda()[None, ...]
         self.faces_static = torch.from_numpy(faces_np).long().cuda()
         
         # Initialize rigid transform parameters (identity transform)
@@ -89,16 +97,33 @@ class MeshGaussianModel(GaussianModel):
             'rotation': torch.zeros([1, 3]).float().cuda(),      # Euler XYZ (radians)
             'translation': torch.zeros([1, 3]).float().cuda(),   # Translation (meters)
         }
+
+        # Check for initialization from npz
+        if init_mesh_transform and os.path.exists(init_mesh_transform):
+            print(f"[MeshGaussianModel] Initializing transform from {init_mesh_transform}")
+            init_data = np.load(init_mesh_transform)
+            if 'rotation' in init_data:
+                self.mesh_param['rotation'] = torch.from_numpy(init_data['rotation']).float().cuda()
+                print(f"[MeshGaussianModel] Loaded rotation: {init_data['rotation']}")
+            if 'translation' in init_data:
+                self.mesh_param['translation'] = torch.from_numpy(init_data['translation']).float().cuda()
+                print(f"[MeshGaussianModel] Loaded translation: {init_data['translation']}")
         
         self.num_timesteps = 1  # Single timestep only
         
         # Initialize mesh properties at identity transform
         self.update_mesh_properties(self.verts_canonical, self.verts_canonical)
         
+        # Print mesh info
+        bbox_min = verts_final.min(axis=0)
+        bbox_max = verts_final.max(axis=0)
+        center = verts_final.mean(axis=0)
         print(f"[MeshGaussianModel] Loaded mesh: {verts_np.shape[0]} verts, "
               f"{faces_np.shape[0]} faces")
-        print(f"[MeshGaussianModel] Canonical bbox: "
-              f"[{verts_centered.min():.3f}, {verts_centered.max():.3f}] meters")
+        print(f"[MeshGaussianModel] Mesh bbox: [{bbox_min[0]:.4f}, {bbox_max[0]:.4f}] x "
+              f"[{bbox_min[1]:.4f}, {bbox_max[1]:.4f}] x [{bbox_min[2]:.4f}, {bbox_max[2]:.4f}]")
+        print(f"[MeshGaussianModel] Mesh center: [{center[0]:.4f}, {center[1]:.4f}, {center[2]:.4f}]")
+
     
     def select_mesh_by_timestep(self, timestep, original=False):
         """

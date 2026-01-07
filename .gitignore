@@ -141,7 +141,10 @@ dmypy.json
 # meta data in macOS
 .DS_Store
 
-LBS/
 flame_model/assets/flame
 viewer_output/
 doc/
+output/
+
+sim_ver_1.2/
+LBS/

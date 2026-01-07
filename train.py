@@ -41,7 +41,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians = MeshGaussianModel(
             dataset.mesh_path, 
             dataset.sh_degree, 
-            not_optimize_mesh_transform=not dataset.optimize_mesh_transform
+            not_optimize_mesh_transform=not dataset.optimize_mesh_transform,
+            point_per_face=dataset.point_per_face,
+            init_mesh_transform=dataset.init_mesh_transform
         )
         mesh_renderer = NVDiffRenderer()
     elif dataset.bind_to_mesh:
@@ -292,6 +294,7 @@ def training_report(tb_writer, iteration, losses, elapsed, testing_iterations, s
                 ssim_test = 0.0
                 lpips_test = 0.0
                 num_vis_img = 10
+                vis_step = max(1, len(config['cameras']) // num_vis_img)  # Prevent division by zero
                 image_cache = []
                 gt_image_cache = []
                 vis_ct = 0
@@ -300,7 +303,7 @@ def training_report(tb_writer, iteration, losses, elapsed, testing_iterations, s
                         scene.gaussians.select_mesh_by_timestep(viewpoint.timestep)
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    if tb_writer and (idx % (len(config['cameras']) // num_vis_img) == 0):
+                    if tb_writer and (idx % vis_step == 0):
                         tb_writer.add_images(config['name'] + "_{}/render".format(vis_ct), image[None], global_step=iteration)
                         error_image = error_map(image, gt_image)
                         tb_writer.add_images(config['name'] + "_{}/error".format(vis_ct), error_image[None], global_step=iteration)
